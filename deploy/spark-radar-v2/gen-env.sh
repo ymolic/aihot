@@ -6,16 +6,14 @@ DIR=/srv/apps/spark-radar-v2
 mkdir -p "$DIR/secrets"
 umask 077
 
-rand() { openssl rand "$1"; }
-
-POSTGRES_PASSWORD=$(rand -hex 24)
-ADMIN_PASSWORD=$(rand -base64 18 | tr -d '/+=' | head -c 20)
-SESSION_SECRET=$(rand -hex 32)
-IMG_PROXY_SIGN_SECRET=$(rand -hex 32)
-INGEST_TOKEN=$(rand -hex 24)
-
 cp /srv/apps/spark-radar/app/secrets/ai_api_key "$DIR/secrets/ai_api_key"
 chmod 600 "$DIR/secrets/ai_api_key"
+
+POSTGRES_PASSWORD=$(openssl rand -hex 24)
+ADMIN_PASSWORD=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
+SESSION_SECRET=$(openssl rand -hex 32)
+IMG_PROXY_SIGN_SECRET=$(openssl rand -hex 32)
+INGEST_TOKEN=$(openssl rand -hex 24)
 
 cat > "$DIR/.env" <<EOF
 POSTGRES_PASSWORD=$POSTGRES_PASSWORD
@@ -32,4 +30,6 @@ EOF
 
 printf '%s\n' "$ADMIN_PASSWORD" > "$DIR/secrets/admin-password.txt"
 chmod 600 "$DIR/.env" "$DIR/secrets/admin-password.txt"
+# 自检：所有 openssl 派生的值都必须非空（只看行长度，不打印值）。
+awk -F= '{ if ($1 != "SITE_URL" && $1 != "LLM_BASE_URL" && $1 != "LLM_MODEL" && $1 != "COLLECT_ENABLED" && $1 != "MODEL_CALLS_ENABLED" && length($0) <= length($1)+1) { print "EMPTY VALUE: " $1; exit 1 } }' "$DIR/.env"
 echo "written: $DIR/.env (chmod 600), $DIR/secrets/admin-password.txt"
