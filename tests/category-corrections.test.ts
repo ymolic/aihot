@@ -43,7 +43,7 @@ test("category corrections revise every standard report atomically without selec
   for (const r of contents) await sql`INSERT INTO reports (kind,key,window_start,window_end,content,generated_at,origin)
     VALUES (${r.kind},${r.key},now(),now(),${sql.json(r.content as never)},now(),'imported')`;
   const [before] = await sql`SELECT selected,seat,score,visible_after,selected_ready_at FROM publications WHERE article_id=${articleId}`;
-  const change = (actor: string) => overrideFields(articleId, { fields: { category: "ai-products", tags: ["开源/仓库", "DeepSeek"] }, version: 0, reason: "工具不是模型" }, actor);
+  const change = (actor: string) => overrideFields(articleId, { fields: { category: "ai-products", tags: ["开源项目", "DeepSeek"] }, version: 0, reason: "工具不是模型" }, actor);
   await sql.unsafe(`CREATE FUNCTION reject_category_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
     IF NEW.actor = 'reject-category' THEN RAISE EXCEPTION 'category audit rejected'; END IF; RETURN NEW; END $$`);
   await sql.unsafe("CREATE TRIGGER reject_category_audit BEFORE INSERT ON audit_log FOR EACH ROW EXECUTE FUNCTION reject_category_audit()");

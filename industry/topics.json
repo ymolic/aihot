@@ -2,18 +2,18 @@
   "groups": [
     {
       "key": "company",
-      "name": "公司与模型",
-      "blurb": "按厂商追踪模型、产品与公司动态"
+      "name": "公司与平台",
+      "blurb": "按厂商追踪模型、产品与开源动态"
     },
     {
       "key": "field",
       "name": "技术方向",
-      "blurb": "按技术领域深挖：Agent、多模态、具身智能……"
+      "blurb": "按技术领域深挖：Agent、编码、部署工程、独立开发……"
     },
     {
       "key": "genre",
       "name": "内容类型",
-      "blurb": "按体裁浏览：论文、教程、观点、政策……"
+      "blurb": "按体裁浏览：开源项目、论文、教程、观点、政策……"
     }
   ],
   "topics": [
@@ -22,7 +22,7 @@
       "name": "OpenAI / ChatGPT",
       "group": "company",
       "entityId": "openai",
-      "definition": "OpenAI 的 GPT 系列模型、ChatGPT 与 Sora 产品更新，以及公司战略与人事变化。"
+      "definition": "OpenAI 的 GPT 系列模型、ChatGPT 与 Codex 产品更新，以及公司战略与人事变化。"
     },
     {
       "slug": "anthropic",
@@ -89,7 +89,7 @@
       "name": "Meta / Llama",
       "group": "company",
       "entityId": "meta",
-      "definition": "Meta 的 Llama 与 Muse 系列模型、超级智能实验室与 Meta AI 产品。"
+      "definition": "Meta 的 Llama 系列开源模型、超级智能实验室与 Meta AI 产品。"
     },
     {
       "slug": "microsoft",
@@ -103,7 +103,7 @@
       "name": "NVIDIA 英伟达",
       "group": "company",
       "entityId": "nvidia",
-      "definition": "英伟达的 GPU 新品、CUDA 软件生态、机器人平台与 AI 算力供需。"
+      "definition": "英伟达的 GPU 新品、CUDA 软件生态与 AI 算力供需，影响自部署和推理成本的选择。"
     },
     {
       "slug": "hugging-face",
@@ -133,7 +133,7 @@
       "tags": [
         "Agent"
       ],
-      "definition": "能自己拆解任务、调用工具、一步步把事办完的 AI 智能体：Claude Code、Manus 等应用，各家 Agent 框架与评测。"
+      "definition": "能自己拆解任务、调用工具、一步步把事办完的 AI 智能体：编码 Agent、Agent 框架与开源实现。"
     },
     {
       "slug": "coding",
@@ -169,7 +169,7 @@
       "tags": [
         "图像生成"
       ],
-      "definition": "AI 画图与修图：文生图模型更新、图像编辑能力与创作工具。"
+      "definition": "AI 画图与修图：文生图模型更新、开源绘图项目与创作工具。"
     },
     {
       "slug": "video",
@@ -178,7 +178,7 @@
       "tags": [
         "视频"
       ],
-      "definition": "AI 生成和理解视频：文生视频模型、视频编辑工具，以及影视创作的新做法。"
+      "definition": "AI 生成和理解视频：文生视频模型、开源视频项目与创作者的新做法。"
     },
     {
       "slug": "voice",
@@ -190,32 +190,22 @@
       "definition": "AI 语音与音频：语音合成、实时语音对话、音乐生成与音频理解的模型与产品。"
     },
     {
-      "slug": "embodied",
-      "name": "具身智能",
-      "group": "field",
-      "tags": [
-        "具身智能"
-      ],
-      "definition": "装进机器人身体里的 AI：人形机器人、具身基础模型，以及在真实环境里动手干活的能力。"
-    },
-    {
       "slug": "on-device",
       "name": "端侧 AI",
       "group": "field",
       "tags": [
         "端侧"
       ],
-      "definition": "直接跑在手机、电脑等设备上的 AI：小模型、在本机运行模型的工具与端侧芯片。"
+      "definition": "直接跑在手机、电脑等设备上的 AI：小模型、在本机运行模型的开源工具与端侧芯片。"
     },
     {
       "slug": "open-source",
       "name": "开源生态",
       "group": "field",
       "tags": [
-        "开源生态",
-        "开源/仓库"
+        "开源生态"
       ],
-      "definition": "开放权重、能下载下来自己部署的模型，开源框架与 GitHub 上爆火的 AI 项目。"
+      "definition": "开放权重与开源社区的运转：许可证之争、项目治理、赞助与供应链动态。"
     },
     {
       "slug": "engineering",
@@ -224,7 +214,7 @@
       "tags": [
         "部署/工程"
       ],
-      "definition": "怎么把模型跑得更快更省钱：推理加速、显存与成本、服务部署与基础设施选型。"
+      "definition": "怎么把模型跑得更快更省钱：推理加速、显存与成本、自部署方案与基础设施选型。"
     },
     {
       "slug": "data-training",
@@ -236,15 +226,6 @@
       "definition": "大模型是怎么练出来的：数据集构建、合成数据、预训练与后训练方法、算力与训练成本。"
     },
     {
-      "slug": "safety",
-      "name": "安全对齐",
-      "group": "field",
-      "tags": [
-        "安全/对齐"
-      ],
-      "definition": "让 AI 可控、可信、不被滥用：越狱与防御、模型行为研究、安全评测与治理框架。"
-    },
-    {
       "slug": "mcp",
       "name": "MCP 与工具调用",
       "group": "field",
@@ -252,6 +233,24 @@
         "MCP/工具调用"
       ],
       "definition": "让 AI 连上外部软件和数据：MCP 协议、function calling 工具调用与各类工具集成。"
+    },
+    {
+      "slug": "indie-dev",
+      "name": "独立开发",
+      "group": "field",
+      "tags": [
+        "独立开发"
+      ],
+      "definition": "一个人做产品卖给全世界：独立开发者的工具选择、变现案例、出海与平台政策。"
+    },
+    {
+      "slug": "workflow",
+      "name": "工作流与自动化",
+      "group": "field",
+      "tags": [
+        "工作流"
+      ],
+      "definition": "把 AI 接进日常流程：自动化编排、效率工具链与可复用的个人工作流。"
     },
     {
       "slug": "model-releases",
@@ -270,6 +269,15 @@
         "产品更新"
       ],
       "definition": "AI 产品与应用的功能上新、改版与商业化——谁家的产品变强了、变贵了、能用了。"
+    },
+    {
+      "slug": "open-source-projects",
+      "name": "开源项目",
+      "group": "genre",
+      "tags": [
+        "开源项目"
+      ],
+      "definition": "值得拿来做或拿来改的开源项目：新项目、重大版本与正在爆发的仓库。"
     },
     {
       "slug": "papers",
@@ -300,12 +308,12 @@
     },
     {
       "slug": "opinions",
-      "name": "大佬观点",
+      "name": "观点评论",
       "group": "genre",
       "tags": [
-        "大佬观点"
+        "观点/评论"
       ],
-      "definition": "行业关键人物在想什么：创始人访谈、研究者论战与投资人判断。"
+      "definition": "行业关键人物在想什么：创始人访谈、研究者论战与值得写成内容的判断。"
     },
     {
       "slug": "trends",
@@ -314,16 +322,16 @@
       "tags": [
         "现象/趋势"
       ],
-      "definition": "AI 正在改变什么：大家怎么用 AI、新能力的出现、对社会与市场格局的影响。"
+      "definition": "AI 与开源正在改变什么：大家怎么用、新能力的出现、对社会与市场格局的影响。"
     },
     {
       "slug": "industry",
-      "name": "行业动态",
+      "name": "行业事件",
       "group": "genre",
       "tags": [
-        "行业动态"
+        "行业事件"
       ],
-      "definition": "AI 圈的商业大事：融资并购、人事变动、合作与竞争、政策与市场变化。"
+      "definition": "AI 圈与开源圈的商业大事：融资并购、人事变动、合作与竞争、平台规则变化。"
     },
     {
       "slug": "policy",
@@ -332,7 +340,7 @@
       "tags": [
         "政策/监管"
       ],
-      "definition": "AI 相关的政策法规与政府监管：立法进展、出口管制与全球治理。"
+      "definition": "AI 相关的政策法规与政府监管：立法进展、平台规则与全球治理。"
     }
   ]
 }

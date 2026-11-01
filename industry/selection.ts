@@ -2,7 +2,10 @@
 // 每篇资料由评分模型独立打两次分（0–100），两次之和 ≥ 2 × 门槛才成为精选候选；
 // 确认新闻身份与新增价值后，由发布规则决定展示（见 docs/selection.md），卡片上显示两次的平均分。
 // 门槛按信源分级区分：官方一手信源的门槛低一些，媒体和个人的高一些；信源类别再把某些官方信源的门槛抬高。
-// 改了门槛或评分提示词，用 scripts/eval-selection.ts 在你自己标注的样本上重跑一遍，再决定上线（见 docs/selection.md）。
+// 注意：这组数沿用示例站的起步值，本行业尚未校准。先标注 100–200 条样本（.data/gold.jsonl，格式见
+// docs/selection.md 与 industry/gold.example.jsonl），再跑
+// node --env-file=.env scripts/eval-selection.ts --gold .data/gold.jsonl
+// 看准确率和门槛扫描，最后才决定调不调（先改评分标准，再动门槛）。
 
 export const SELECTION = {
   /**
@@ -15,11 +18,13 @@ export const SELECTION = {
    * 信源类别 → 门槛下限。分级只说明来源是不是官方、一手；有些官方信源的日常内容主要写给开发者或业内，
    * 读者要看的只是其中的大事，就在后台“信源”里给它一个类别，门槛抬到不低于这里的数。
    * 只抬不降：分级门槛本来就更高的（媒体）不受影响。没有类别的信源只按分级。
-   *   ecosystem 生态与基础设施：芯片与硬件、推理与云服务、模型托管、开发框架与工具链、安全研究厂商、工程与开发者博客
+   *   devinfra 开发者生态与基础设施：GitHub、Hugging Face、NVIDIA、云与推理框架这类官方开发者渠道，
+   *            日常大量生态与工具内容，读者要看的只是其中的大事
    *   leaderboard 评测榜单：给各家模型跑分、排名的评测机构
+   * 类别未随本行业校准，首轮评测后可一并复核。
    */
   classes: {
-    ecosystem: { label: "生态与基础设施", threshold: 70 },
+    devinfra: { label: "开发者生态与基础设施", threshold: 70 },
     leaderboard: { label: "评测榜单", threshold: 76 },
   } as Record<string, { label: string; threshold: number }>,
   /**

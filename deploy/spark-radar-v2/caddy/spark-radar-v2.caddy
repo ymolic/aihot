@@ -1,0 +1,22 @@
+# Spark 雷达 v2 站点块（共享 Caddy include）。
+# 部署方式与 spark-radar 相同：bind-mount 到共享 Caddy 容器的
+# /etc/caddy/includes/ 下，主 Caddyfile 第 76 行 import /etc/caddy/includes/*.caddy 生效。
+# 挂载变更需要改 obsidian-livesync 栈的 compose override 并重建 Caddy 容器（短暂中断）。
+# 前置条件：Cloudflare 上 radar.yydsoh.com 的 proxied A/AAAA 记录已存在，否则证书签发会失败。
+
+radar.yydsoh.com {
+	# 只接受 Cloudflare 边缘来源（cloudflare-ip-ranges-begin/end 之间为官方 IP 段快照）。
+	@not_cloudflare {
+		not remote_ip 173.245.48.0/20 103.21.244.0/22 103.22.200.0/22 103.31.4.0/22 141.101.64.0/18 108.162.192.0/18 190.93.240.0/20 188.114.96.0/20 197.234.240.0/22 198.41.128.0/17 162.158.0.0/15 104.16.0.0/13 104.24.0.0/14 172.64.0.0/13 131.0.72.0/22 2400:cb00::/32 2606:4700::/32 2803:f800::/32 2405:b500::/32 2405:8100::/32 2a06:98c0::/29 2c0f:f248::/32
+	}
+	respond @not_cloudflare "Direct origin access is disabled" 403
+
+	encode zstd gzip
+
+	reverse_proxy spark-radar-v2-web:3000 {
+		# 健康检查快速失败，避免上游重启时长时间挂起。
+		health_uri /api/health
+		health_interval 30s
+		health_timeout 5s
+	}
+}

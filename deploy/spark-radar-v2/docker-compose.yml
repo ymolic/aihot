@@ -1,0 +1,116 @@
+# Spark 雷达 v2 —— 生产 compose（oracle-us-apps）
+#
+# 与仓库根 docker-compose.yml（本地/上游默认）的差异：
+# - 不带自带 Caddy profile：复用主机共享 Caddy（站点块在 deploy/spark-radar-v2/caddy/）。
+# - web 不映射宿主端口，加入外部 spark-edge 网络供共享 Caddy 反代。
+# - api/worker 加入外部 spark-ai-consumers 网络复用 CLIProxyAPI（http://cli-proxy-api:8317/v1）。
+# - 密钥经 env_file 注入（服务器上生成，不入库）：deploy/spark-radar-v2/../../.env
+#   部署时放在 /srv/apps/spark-radar-v2/.env（chmod 600）。
+#
+# 用法（在仓库根目录）：
+#   docker compose -f deploy/spark-radar-v2/docker-compose.yml up -d --build
+#   首次部署 setup 会自动跑迁移与 seed。
+name: spark-radar-v2
+
+x-backend: &backend
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  image: spark-radar-v2-app
+  restart: unless-stopped
+
+x-backend-net: &backend-net
+  <<: *backend
+  env_file: .env
+  environment: &backend-env
+    NODE_ENV: production
+    DATABASE_URL: postgres://aihot:${POSTGRES_PASSWORD:?set in .env}@db:5432/aihot
+    AIHOT_DATA_DIR: /data
+    API_BASE_URL: http://api:3001
+    INGEST_RATE_LIMIT: ${INGEST_RATE_LIMIT:-10}
+  volumes:
+    - data:/data
+  networks:
+    - internal
+  depends_on:
+    db:
+      condition: service_healthy
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: aihot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+      POSTGRES_DB: aihot
+    volumes:
+      - db:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aihot -d aihot"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  # 迁移 + seed，跑完退出。
+  setup:
+    <<: *backend-net
+    restart: "no"
+    command: ["sh", "-c", "node scripts/migrate.ts && node scripts/seed.ts"]
+
+  api:
+    <<: *backend-net
+    command: ["node", "apps/api/src/main.ts"]
+    environment:
+      <<: *backend-env
+      API_HOST: 0.0.0.0
+      API_PORT: "3001"
+    networks:
+      - internal
+      - spark-ai-consumers
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  worker:
+    <<: *backend-net
+    command: ["node", "apps/worker/src/main.ts"]
+    stop_grace_period: 515s
+    networks:
+      - internal
+      - spark-ai-consumers
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+
+  web:
+    <<: *backend
+    command: ["node", "apps/web/server.ts"]
+    environment:
+      NODE_ENV: production
+      API_BASE_URL: http://api:3001
+      SITE_URL: ${SITE_URL:?set in .env}
+      TRUST_PROXY: "true"
+      AIHOT_RELEASE: ${AIHOT_RELEASE:-}
+      WEB_HOST: 0.0.0.0
+      WEB_PORT: "3000"
+    networks:
+      spark-edge:
+        aliases:
+          - spark-radar-v2-web
+    depends_on:
+      api:
+        condition: service_started
+
+networks:
+  internal: {}
+  spark-edge:
+    external: true
+  spark-ai-consumers:
+    external: true
+
+volumes:
+  db: {}
+  data: {}
