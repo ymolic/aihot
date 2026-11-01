@@ -6,7 +6,8 @@
 import { guardedFetch, HttpStatusError } from "@aihot/backend/lib/http-fetch";
 import { stripTags, truncate } from "@aihot/backend/lib/text";
 
-const FRONT_PAGE = "https://hn.algolia.com/api/v1/front_page";
+// Algolia has no /front_page route; the front page is a search over the `front_page` tag.
+const FRONT_PAGE = "https://hn.algolia.com/api/v1/search?tags=front_page";
 
 /** The module's interest, ported from spark-radar's adapter. */
 const AI_TERMS = /\b(ai|agent|llm|model|openai|anthropic|mcp|machine learning|developer tool)\b/i;
