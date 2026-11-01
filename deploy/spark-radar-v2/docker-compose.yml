@@ -97,6 +97,8 @@ services:
       WEB_HOST: 0.0.0.0
       WEB_PORT: "3000"
     networks:
+      # web 要经内网访问 api；spark-edge 仅供共享 Caddy 反代。
+      internal: {}
       spark-edge:
         aliases:
           - spark-radar-v2-web
