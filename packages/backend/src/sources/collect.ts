@@ -1,7 +1,7 @@
 // Collection run for one source: fetch listing → filter → store material → enqueue processing.
 // A failed fetch never advances the success cursor; the source's health reflects consecutive failures.
 import { sql, type Db } from "../db.ts";
-import { fillScheduledPublications, identityKeyFor, reuseExternalMaterialIdentities, STALE_ON_DISCOVERY_MS, upsertMaterial } from "../content/materials.ts";
+import { fillScheduledPublications, FUTURE_TOLERANCE_MS, identityKeyFor, materialIdentityForUrl, reuseExternalMaterialIdentities, STALE_ON_DISCOVERY_MS, upsertMaterial } from "../content/materials.ts";
 import { PresentationMismatch } from "../content/presentation.ts";
 import { HttpStatusError } from "../lib/http-fetch.ts";
 import { identityKeyForUrl } from "../lib/url.ts";
@@ -16,6 +16,7 @@ import { admitListing, filterPublicationWindow } from "./filters.ts";
 import { fetchJsonList } from "./json-list.ts";
 import { fetchXSearch, planXShards, readXSearch, shardHandle, shardQuery, selfThreadHandle, SHARDABLE_SQL, tweetToCandidate, type XBacklog } from "./x.ts";
 import { FetchError, type Candidate, type SourceRow } from "./types.ts";
+import { readsWhole, usePace } from "./uses.ts";
 
 export interface CollectResult {
   sourceId: string;
@@ -28,7 +29,7 @@ export interface CollectResult {
 
 export async function loadSource(id: string): Promise<SourceRow | null> {
   const [s] = await sql<SourceRow[]>`
-    SELECT id, name, kind, config, tier, participation_mode, first_party, interval_minutes, enabled, cursor, fail_count
+    SELECT id, name, kind, config, tier, participation_mode, uses, first_party, interval_minutes, enabled, cursor, fail_count
     FROM sources WHERE id = ${id}`;
   return s ?? null;
 }
@@ -75,9 +76,11 @@ export async function listingEntries(source: SourceRow, found: Candidate[]): Pro
   const unreliableDates = source.config.detail?.publishedAtAuthoritative === true;
   const unique = new Map<string, CollectionCandidate>();
   for (const c of candidates) {
-    const identityKey = c.identityKey
+    const requestedIdentity = c.identityKey
       ?? (source.config.preserveUrlFragment === true ? identityKeyForUrl(c.url, { keepFragment: true }) : null)
       ?? identityKeyFor({ ...c, sourceId: source.id, via: "fetch" });
+    const identityKey = requestedIdentity === identityKeyForUrl(c.url)
+      ? await materialIdentityForUrl(c.url) ?? requestedIdentity : requestedIdentity;
     if (!unique.has(identityKey)) unique.set(identityKey, { ...c, identityKey, ...(unreliableDates ? { publishedAt: null, publicationTime: null } : {}) });
   }
   return [...unique.values()];
@@ -99,8 +102,21 @@ function admission(source: SourceRow, known: Map<string, StoredDetail>, firstImp
   return { byListing, admits: (c: Candidate) => byListing(c) && filterPublicationWindow([c], source.config.publishedAfter).length > 0 };
 }
 
-/** Entries detail pages dated out of admission, by identity: the listing date read with, and the page's date. */
-type DatedOut = Record<string, [listed: string | null, found: string | null]>;
+/** Excluded detail dates expire: an undated listing cannot reveal a corrected date on the page. */
+type DatedOut = Record<string, [listed: string | null, found: string | null, checkedAt: number | null]>;
+// No date, or an explicit access refusal (null checkedAt), keeps the existing read-once rule.
+const currentDateRead = (read: DatedOut[string]) => read[1] === null || read[2] === null || read[2] > Date.now() - DAY_MS;
+/** Entries whose page keeps failing with a recoverable error, by identity: straight failures and the last one's time. */
+type Retries = Record<string, [failures: number, at: string]>;
+
+const HOUR_MS = 3_600_000;
+/**
+ * How long a page waits after its latest straight failure. Production, 30 days to 2026-10-19: one-off
+ * timeouts and TLS drops were gone by the next run, but pages also came back after a day (a Qoder post
+ * online 25 hours late) while others failed on every run for days (a challenge page, HN buzzing 47
+ * times in two days). Two quick retries, then an hour doubling to a day: never given up.
+ */
+const retryWait = (failures: number) => failures < 3 ? 0 : Math.min(24 * HOUR_MS, HOUR_MS * 2 ** (failures - 3));
 
 export interface DetailReads {
   attempts: number;
@@ -109,8 +125,12 @@ export interface DetailReads {
   /** Entries whose page is still to be read: over the budget, after a spent provider budget, or failed. */
   pending: number;
   failures: Array<{ url: string; error: string }>;
+  /** Pages the site refused: its answer, read once and recorded, not a failure of ours. */
+  refused: Array<{ url: string; error: string }>;
   /** The listing date of each entry a page dated under the rules in force, this run or remembered. */
-  listed: Map<string, string | null>;
+  listed: Map<string, DatedOut[string]>;
+  /** Listed entries whose page still fails with a recoverable error. */
+  retries: Retries;
 }
 
 /**
@@ -137,7 +157,7 @@ function detailNeed(c: CollectionCandidate, stored: StoredDetail | undefined, so
     date: d.publishedAtAuthoritative === true || !(stored?.published_at || c.publishedAt) || d.upgradeDatePrecision === true,
     title: !!(d.titleSelector || d.titleRegex) && (d.titleAuthoritative === true || (!storedHeadline && needsTitle(c.title))),
     summary: !!d.summarySelector && !(stored?.excerpt || c.excerpt),
-    body: source.participation_mode === "editorial" && stored?.body_status !== "ok" && !c.bodyText && (!c.bodyStatus || c.bodyStatus === "pending"),
+    body: readsWhole(source) && stored?.body_status !== "ok" && !c.bodyText && (!c.bodyStatus || c.bodyStatus === "pending"),
   };
   return need.date || need.title || need.summary ? need : null;
 }
@@ -167,15 +187,16 @@ function applyDetail(c: CollectionCandidate, got: Awaited<ReturnType<typeof fetc
  * under the rules in force is not read again, and another source's material takes nothing from this
  * listing (materials.ts): its page is not worth a read. An entry its page dated out of admission is
  * remembered (`datedOut`): while listed with the same date and still not admitted, it keeps that date
- * unread, so the same page is not bought on every run and an archive does not use up the budget. A
+ * for a day, so an archive does not use up every run's budget and corrected dates can recover. A
  * spent provider budget defers the remaining pages; other failures are reported, not thrown, and a page
- * the site refuses is not read again under the same rules. Each run continues after the last attempted
- * identity, so a recoverable failure cannot keep taking the budget from all later entries.
+ * the site refuses is not read again under the same rules; one that keeps failing otherwise waits longer
+ * between tries (`retries`, retryWait). Each run continues after the last attempted identity, so a
+ * recoverable failure cannot keep taking the budget from all later entries.
  */
 export async function enrichDetails(candidates: CollectionCandidate[], source: SourceRow, known: Map<string, StoredDetail>,
-  opts: { budget: number; after?: string; datedOut: DatedOut; admits: (c: Candidate) => boolean }): Promise<DetailReads> {
+  opts: { budget: number; after?: string; datedOut: DatedOut; retries: Retries; admits: (c: Candidate) => boolean }): Promise<DetailReads> {
   const rules = detailRulesOf(source);
-  const reads: DetailReads = { attempts: 0, pending: 0, failures: [], listed: new Map() };
+  const reads: DetailReads = { attempts: 0, pending: 0, failures: [], refused: [], listed: new Map(), retries: {} };
   let providerBudgetSpent = false;
   const start = candidates.findIndex(c => c.identityKey === opts.after) + 1;
   const ordered = [...candidates.slice(start), ...candidates.slice(0, start)];
@@ -189,36 +210,48 @@ export async function enrichDetails(candidates: CollectionCandidate[], source: S
     const listed = c.publishedAt?.toISOString() ?? null;
     const seen = opts.datedOut[c.identityKey!];
     const remembered = seen?.[1] ? new Date(seen[1]) : null;
+    const retry = opts.retries[c.identityKey!];
     if (seen && seen[0] === listed && !opts.admits({ ...c, publishedAt: remembered })) {
       c.publishedAt = remembered;
-      reads.listed.set(c.identityKey!, listed);
-    } else if (providerBudgetSpent || reads.attempts >= opts.budget) {
+      reads.listed.set(c.identityKey!, seen);
+      if (currentDateRead(seen)) continue;
+    }
+    if (providerBudgetSpent || reads.attempts >= opts.budget || retry && Date.now() < Date.parse(retry[1]) + retryWait(retry[0])) {
       reads.pending += 1;
+      if (retry) reads.retries[c.identityKey!] = retry;
     } else {
       reads.attempts += 1;
       reads.after = c.identityKey;
       try {
-        applyDetail(c, await fetchDetail(c.url, source, need), rules!);
-        reads.listed.set(c.identityKey!, listed);
+        const got = await fetchDetail(c.url, source, need);
+        if (got.publishedAt) c.publishedAt = listed ? new Date(listed) : null;
+        applyDetail(c, got, rules!);
+        reads.listed.set(c.identityKey!, [listed, c.publishedAt?.toISOString() ?? null, Date.now()]);
       } catch (error) {
         if (shutdownSignal.signal.aborted) throw error;
         // A spent provider budget is not the source's failure.
-        if (error instanceof BudgetExceededError) providerBudgetSpent = true;
-        else reads.failures.push({ url: c.url, error: String(error instanceof Error ? error.message : error).slice(0, 300) });
+        const failed = !(error instanceof BudgetExceededError);
         // A page the site refuses (paywall, captcha, blocked address) is read under these rules once, like
         // a page without the fields: read again on every run it took the budget from the entries behind
         // it. A missing page, a timeout, rate limiting and server errors have recovered, so they are retried.
-        if (error instanceof HttpStatusError && error.status < 500 && ![404, 408, 425, 429].includes(error.status)) {
+        const refused = error instanceof HttpStatusError && error.status < 500 && ![404, 408, 425, 429].includes(error.status);
+        if (!failed) providerBudgetSpent = true;
+        else (refused ? reads.refused : reads.failures).push({ url: c.url, error: String(error instanceof Error ? error.message : error).slice(0, 300) });
+        if (refused) {
           c.detailRules = rules!;
-          reads.listed.set(c.identityKey!, listed);
-        } else reads.pending += 1;
+          reads.listed.set(c.identityKey!, [listed, c.publishedAt?.toISOString() ?? null, null]);
+        } else {
+          reads.pending += 1;
+          if (failed) reads.retries[c.identityKey!] = [(retry?.[0] ?? 0) + 1, new Date().toISOString()];
+          else if (retry) reads.retries[c.identityKey!] = retry;
+        }
       }
     }
   }
   return reads;
 }
 
-async function store(sourceId: string, runId: number, candidates: CollectionCandidate[], backfill: string | null) {
+async function store(sourceId: string, candidates: CollectionCandidate[], backfill: string | null) {
   let created = 0;
   let revised = 0;
   for (const c of candidates) {
@@ -227,12 +260,8 @@ async function store(sourceId: string, runId: number, candidates: CollectionCand
     try { res = await upsertMaterial(material); }
     catch (error) {
       if (!(error instanceof PresentationMismatch)) throw error;
-      // This article's transaction retained the consistent original and translation. Keep its
-      // actionable failure on the fetch run, without withholding later articles in this listing.
-      await sql`UPDATE fetch_runs SET detail = coalesce(detail,'{}'::jsonb) || jsonb_build_object('presentationFailures',
-        coalesce(detail->'presentationFailures','[]'::jsonb) ||
-          ${sql.json([{ identityKey: identityKeyFor(material), url: c.url, error: error.message }])}::jsonb)
-        WHERE id=${runId}`;
+      // Same wording, a layout the translation cannot follow: the article's transaction retained the
+      // consistent original and translation, which is the outcome; later articles are still stored.
       continue;
     }
     // A successful page with no matching field is complete too. Otherwise an undated article at
@@ -304,7 +333,8 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
     const rules = detailRulesOf(source);
     if (source.kind === "rss") {
       // Changed detail rules require the listing again even when its bytes did not change.
-      const rss = await fetchRss(source, { force: opts.force || !!rules && source.cursor?.detailRules !== rules });
+      const expiredDates = Object.values(source.cursor?.detailDatedOut ?? {}).some(read => !currentDateRead(read as DatedOut[string]));
+      const rss = await fetchRss(source, { force: opts.force || expiredDates || !!rules && source.cursor?.detailRules !== rules });
       candidates = rss.candidates;
       // The first import keeps only part of the listing: the next run reads all of it once before
       // accepting 304s, for the recent entries the import left out. Persist validators only after store succeeds.
@@ -338,9 +368,10 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
       budget: Number(d?.maxFetches ?? 0), admits,
       after: source.cursor?.detailRules === rules ? source.cursor?.detailAfter : undefined,
       datedOut: source.cursor?.detailRules === rules ? source.cursor?.detailDatedOut ?? {} : {},
+      retries: source.cursor?.detailRules === rules ? source.cursor?.detailRetries ?? {} : {},
     });
     if (d) {
-      detail = { ...detail, detailAttempts: reads.attempts, detailFailures: reads.failures.length, detailPending: reads.pending, detailErrors: reads.failures };
+      detail = { ...detail, detailAttempts: reads.attempts, detailFailures: reads.failures.length, detailPending: reads.pending, detailErrors: [...reads.failures, ...reads.refused] };
       nextCursor.detailRules = rules;
       if (reads.after) nextCursor.detailAfter = reads.after;
       // A validator covers the whole listing: accept 304 only after its detail work is complete.
@@ -352,14 +383,17 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
     const datedOut: DatedOut = {};
     candidates = candidates.filter((c) => {
       if (admits(c)) return true;
+      // A future entry can become admissible without changing the feed's bytes or validator.
+      if (source.kind === "rss" && c.publishedAt && c.publishedAt.getTime() > Date.now() + FUTURE_TOLERANCE_MS) delete nextCursor.rss;
       const listed = reads.listed.get(c.identityKey!);
-      if (listed !== undefined) datedOut[c.identityKey!] = [listed, c.publishedAt?.toISOString() ?? null];
+      if (listed !== undefined) datedOut[c.identityKey!] = listed;
       return false;
     });
     // Kept while the listing offers them; a 304 offers no entries and keeps the last ones.
-    if (found) nextCursor.detailDatedOut = datedOut;
+    if (found) { nextCursor.detailDatedOut = datedOut; nextCursor.detailRetries = reads.retries; }
     if (!d || !Object.keys(nextCursor.detailDatedOut ?? {}).length) delete nextCursor.detailDatedOut;
-    const stored = await store(sourceId, run!.id, candidates, firstImport ? "first-import" : null);
+    if (!d || !Object.keys(nextCursor.detailRetries ?? {}).length) delete nextCursor.detailRetries;
+    const stored = await store(sourceId, candidates, firstImport ? "first-import" : null);
     ({ created, revised } = stored);
     for (const id of await fillScheduledPublications(sourceId)) await queueProcessing(id);
 
@@ -400,13 +434,13 @@ function coveredTo(m: SourceRow): bigint {
  * it, and every account keeps its own fetch run, health and cursor. The oldest watermark bounds the
  * search, so no account misses a post (the others only see posts they already have again); afterwards
  * each account's watermark moves to its own newest post the search saw (another account's would hide
- * its late posts and, read on its own, the posts below it), and the stretches still unread are kept in
- * each account's cursor, so they survive a change of shards.
+ * its late posts and, read on its own, the posts below it), and the stretches still unread are kept on
+ * one account of the shard, so they survive a change of shards without every later shard buying them.
  */
 export async function collectXShard(key: string, sourceIds: string[]): Promise<{ key: string; status: "ok" | "failed" | "skipped"; accounts: number; found: number; created: number; error?: string }> {
   const members = (
     await sql<SourceRow[]>`
-      SELECT id, name, kind, config, tier, participation_mode, first_party, interval_minutes, enabled, cursor, fail_count
+      SELECT id, name, kind, config, tier, participation_mode, uses, first_party, interval_minutes, enabled, cursor, fail_count
       FROM sources WHERE id IN ${sql(sourceIds)} ORDER BY id`
   ).filter((m) => m.enabled && shardHandle(m));
   if (members.length === 0) return { key, status: "skipped", accounts: 0, found: 0, created: 0 };
@@ -417,33 +451,44 @@ export async function collectXShard(key: string, sourceIds: string[]): Promise<{
   let created = 0;
   try {
     const since = members.map(coveredTo).reduce((a, b) => (b < a ? b : a));
-    const backlog: XBacklog[] = [];
-    const stretches = new Set<string>();
-    for (const m of members) {
-      for (const b of (Array.isArray(m.cursor?.xBacklog) ? m.cursor.xBacklog : []) as XBacklog[]) {
-        if (!stretches.has(`${b.query} ${b.next}`)) backlog.push(b);
-        stretches.add(`${b.query} ${b.next}`);
-      }
-    }
+    // readXSearch keeps one copy per query and gives up stretches left over for days.
+    const backlog: XBacklog[] = members.flatMap((m) => (Array.isArray(m.cursor?.xBacklog) ? m.cursor.xBacklog as XBacklog[] : []));
     const read = await readXSearch(shardQuery(members.map((m) => shardHandle(m)!), members.map(selfThreadHandle).filter((h): h is string => h !== null)), { lastId: String(since), backlog, subject: `x-shard:${key}` });
     const detail = { shard: key, accounts: members.length, pages: read.pages, truncated: read.truncated, backlog: read.backlog.length, backlogPages: read.backlogPages, dropped: read.dropped };
     const counts = new Map<string, { found: number; created: number; newest: string }>();
     for (const m of members) {
       const handle = shardHandle(m)!.toLowerCase();
       const mine = read.tweets.filter((t) => t.user.screen_name.toLowerCase() === handle);
-      const stored = await store(m.id, runs.get(m.id)!, admitListing(mine.map(tweetToCandidate), m), null);
+      const stored = await store(m.id, admitListing(mine.map(tweetToCandidate), m), null);
       found += mine.length;
       created += stored.created;
       const newest = mine.reduce((a, t) => (BigInt(t.id_str) > BigInt(a) ? t.id_str : a), String(m.cursor!.lastTweetId));
       counts.set(m.id, { found: mine.length, created: stored.created, newest });
     }
+    // A stretch left over before a regrouping still names accounts now in other shards, which hold no copy
+    // of it and whose coverage has moved on: their posts go to them from here.
+    const here = new Set(members.map((m) => shardHandle(m)!.toLowerCase()));
+    const strays = read.tweets.filter((t) => !here.has(t.user.screen_name.toLowerCase()));
+    if (strays.length) {
+      const owners = await sql<SourceRow[]>`
+        SELECT id, name, kind, config, tier, participation_mode, uses, first_party, interval_minutes, enabled, cursor, fail_count
+        FROM sources WHERE enabled AND ${sharded()}`;
+      for (const owner of owners) {
+        const handle = shardHandle(owner)?.toLowerCase();
+        const mine = strays.filter((t) => t.user.screen_name.toLowerCase() === handle);
+        if (mine.length) created += (await store(owner.id, admitListing(mine.map(tweetToCandidate), owner), null)).created;
+      }
+    }
     // Only a fully stored search advances coverage. A failed write can replay every paid page;
-    // material already committed is idempotent, and no member is left half-finished.
+    // material already committed is idempotent, and no member is left half-finished. The unread stretch
+    // is written once, on the shard's first account: on every member it travelled with them when shards
+    // were regrouped, and each shard then bought its own copy of the same pages.
+    const keeper = members[0]!.id;
     await sql.begin(async tx => {
       for (const m of members) {
         const { newest, ...count } = counts.get(m.id)!;
         const cursor: Record<string, unknown> = { ...m.cursor, lastTweetId: newest, lastOkAt: new Date().toISOString() };
-        if (read.backlog.length) cursor.xBacklog = read.backlog;
+        if (read.backlog.length && m.id === keeper) cursor.xBacklog = read.backlog;
         else delete cursor.xBacklog;
         await recordFetch(tx, m.id, runs.get(m.id)!, { ...count, detail, cursor });
       }
@@ -495,15 +540,21 @@ export async function scheduleDueSources(): Promise<{ enqueued: number; shards: 
 
 /** Minutes between reads of a shard: editorial accounts every half hour, hot-signal accounts hourly. */
 const X_SHARD_MINUTES: Record<string, number> = { editorial: 30, hot_signal: 60 };
-const shardMinutes = (mode: string) => X_SHARD_MINUTES[mode] ?? 60;
+/** An account outside the news is read as often as its uses ask, hourly when none says. */
+const shardMinutes = (mode: string, uses: readonly string[]) => X_SHARD_MINUTES[mode] ?? (Number.isFinite(usePace(uses)) ? usePace(uses) : 60);
+
+/** Listings read through Jina, paid per read. */
+const paidListing = sql`coalesce(config->>'url', '') LIKE 'https://r.jina.ai/%'`;
+/** They are not looked at more than hourly: busy ones would outrun Jina's daily budget. */
+const PAID_LISTING_FLOOR = 60;
 
 /**
  * Daily: adapt each source's interval to its recent output (active 15 min … quiet 120 min).
- * hot_signal sources are allowed to be slower.
+ * hot_signal sources are allowed to be slower; the source's other uses may ask for it sooner.
  */
 export async function adaptIntervals(): Promise<{ updated: number }> {
-  const rows = await sql<Array<Pick<SourceRow, "id" | "participation_mode" | "kind" | "config" | "cursor"> & { paid_listing: boolean; per_day: number }>>`
-    SELECT s.id, s.participation_mode, s.kind, s.config, s.cursor, coalesce(s.config->>'url', '') LIKE 'https://r.jina.ai/%' AS paid_listing,
+  const rows = await sql<Array<Pick<SourceRow, "id" | "participation_mode" | "uses" | "kind" | "config" | "cursor"> & { paid_listing: boolean; per_day: number }>>`
+    SELECT s.id, s.participation_mode, s.uses, s.kind, s.config, s.cursor, ${paidListing} AS paid_listing,
       (SELECT count(*) FROM articles a WHERE a.source_id = s.id AND a.discovered_at > now() - interval '7 days' AND NOT a.backfill) / 7.0 AS per_day
     FROM sources s WHERE s.enabled AND s.kind IN ('rss', 'web_list', 'json_list', 'x_search')`;
   let updated = 0;
@@ -513,12 +564,28 @@ export async function adaptIntervals(): Promise<{ updated: number }> {
     // editorial X and listings read through Jina stop at two hours (paid per call, within their budgets);
     // hot signals may wait longer.
     const max = r.participation_mode === "hot_signal" ? 180 : r.kind === "x_search" || r.paid_listing ? 120 : 60;
-    // Listings read through Jina are not looked at more than hourly: busy ones would outrun its daily budget.
-    const min = r.paid_listing ? 60 : 15;
+    const min = r.paid_listing ? PAID_LISTING_FLOOR : 15;
     // X accounts read by shard follow the shard's pace, whatever their own volume.
-    const target = shardHandle(r) ? shardMinutes(r.participation_mode) : perDay <= 0.15 ? max : Math.round(Math.min(max, Math.max(min, (24 * 60) / (perDay * 3))));
+    const own = shardHandle(r) ? shardMinutes(r.participation_mode, r.uses) : perDay <= 0.15 ? max : Math.round(Math.min(max, Math.max(min, (24 * 60) / (perDay * 3))));
+    // Another use may want the source sooner, never later, and a paid listing still waits its hour.
+    const target = Math.max(min, Math.min(own, usePace(r.uses)));
     const res = await sql`UPDATE sources SET interval_minutes = ${target} WHERE id = ${r.id} AND interval_minutes <> ${target}`;
     updated += res.count;
   }
   return { updated };
+}
+
+/**
+ * A source's uses just changed: from now it waits no longer than they allow, and no longer than that for its next
+ * read. A faster pace it already has stays, and a paid listing still waits its hour; the next daily adaptation
+ * weighs its output as usual. Kinds read on another trigger (WeChat accounts, outside reports) keep theirs.
+ */
+export async function applyUsePace(id: string): Promise<void> {
+  const [s] = await sql<{ uses: string[]; interval_minutes: number; paid_listing: boolean }[]>`
+    SELECT uses, interval_minutes, ${paidListing} AS paid_listing FROM sources WHERE id = ${id} AND kind IN ('rss', 'web_list', 'json_list', 'x_search')`;
+  if (!s) return;
+  const capped = Math.min(s.interval_minutes, usePace(s.uses));
+  const target = s.paid_listing ? Math.max(PAID_LISTING_FLOOR, capped) : capped;
+  await sql`UPDATE sources SET interval_minutes = ${target}, next_fetch_at = LEAST(coalesce(next_fetch_at, now()), now() + make_interval(mins => ${target}))
+    WHERE id = ${id}`;
 }

@@ -1,4 +1,4 @@
-import { REPORTS, SITE } from "@aihot/site";
+import { REPORTS, SEO_TITLES, SITE } from "@aihot/site";
 import { Link, redirect, useLoaderData } from "react-router";
 import type { Route } from "./+types/topic";
 import type { TopicPage } from "@aihot/contracts/site";
@@ -9,8 +9,8 @@ import { DayList, Pagination } from "../features/feed/DayList";
 import { BrandMark } from "../components/BrandMark";
 import { EmptyState } from "../components/ui/Page";
 import { IconArrowLeft } from "../components/icons";
-import { beijingDate, monthDay } from "@aihot/contracts/time";
-import { monthDayTime } from "../lib/format";
+import { beijingDate } from "@aihot/contracts/time";
+import { monthDay, monthDayTime } from "../lib/format";
 import { PhoneBar } from "../components/shell/PhoneBar";
 import { navUp } from "../components/shell/nav";
 import type { Screen } from "../components/shell/screens";
@@ -46,7 +46,10 @@ function partsOf(data: TopicPage): Part[] {
   });
 }
 
-/** The search snippet: what the topic covers, after when it last changed and its biggest recent events. */
+/**
+ * The search snippet: what the topic covers, after when it last changed and its biggest recent events. People search
+ * "{name} 最新动态"; the page showed for that query but was rarely clicked while the snippet was the bare definition.
+ */
 function description(data: TopicPage, parts: Part[]): string {
   const { topic } = data;
   let text = topic.definition;
@@ -66,7 +69,7 @@ export function meta({ loaderData }: Route.MetaArgs) {
   return pageMeta({
     title: page > 1
       ? `${topic.name} 精选 · 第 ${page} 页`
-      : `${topic.name} 最新动态${parts.length ? `与${parts.map((p) => p.name).join("、")}` : ""}`,
+      : SEO_TITLES.topic(topic.name, topic.group, topic.latest ? monthDay(beijingDate(topic.latest.at)) : null),
     description: text,
     path,
     image: `/og/topics/${topic.slug}.png`,

@@ -2,13 +2,12 @@
 // It owns identity, revisions and the timeline rule, so no entrance can bypass them.
 import { sql, type Db, type Tx } from "../db.ts";
 import { newArticleId, sha256, stableJson } from "../lib/ids.ts";
-import { identityKeyForUrl } from "../lib/url.ts";
+import { identityKeyForUrl, normalizeUrl, wechatPostUrl } from "../lib/url.ts";
 import { collapseWhitespace, decodeEntities } from "../lib/text.ts";
 import { publishArticleTx } from "../publication/publish.ts";
 import { groupingReset, reconcileMaterialSource } from "./provenance.ts";
 import { emit } from "../modules.ts";
 import { rebaseTranslation } from "./presentation.ts";
-import { audit } from "../audit.ts";
 
 export interface MediaItem {
   kind: "image" | "video";
@@ -159,6 +158,9 @@ export function isHistorical(a: { backfill: boolean; published_at: Date | null; 
 /** Not isHistorical, as a condition on the material row `a` of a query. */
 export const newsCondition = sql`(NOT a.backfill OR a.discovered_at - a.published_at <= make_interval(secs => ${STALE_ON_DISCOVERY_MS / 1000}))`;
 
+/** No more of the material's text is coming: its body is in, or processing went past fetching one (row `a`). */
+export const textSettled = sql`(a.body_status <> 'pending' OR a.processing_state <> 'new')`;
+
 /** Identity of semantic input; presentation changes preserve this revision and its paid decisions. */
 export function contentHash(c: { title: string; bodyText?: string | null; excerpt?: string | null }): string {
   return sha256([collapseWhitespace(c.title), collapseWhitespace(c.bodyText ?? ""), collapseWhitespace(c.excerpt ?? "")].join("\u0001"));
@@ -180,12 +182,47 @@ function sameBarringLoss(a: string | null | undefined, b: string | null | undefi
   return x.length === y.length && x.every((c, i) => c === y[i] || c === LOST || y[i] === LOST);
 }
 
+/**
+ * An excerpt with the numbers masked in the run of labelled counts that ends it (`Stars: 12976 Forks: 2545`):
+ * a listing refreshes them on every load, so they say nothing about the material. Labels and other numbers
+ * stay, a lone `Accuracy: 90.5` too: an excerpt can be the article's text, where a changed figure is a correction.
+ */
+const maskTrailingCounts = (s: string | null | undefined) => s?.replace(/(?:\s*\p{L}+[:：]\s*\d[\d,]*){2,}\s*$/u, (run) => run.replace(/\d[\d,]*/g, "#"));
+
 export function identityKeyFor(m: MaterialInput): string {
   if (m.identityKey) return m.identityKey;
   if (m.xPost?.tweetId) return `x:${m.xPost.tweetId}`;
   const fromUrl = identityKeyForUrl(m.url);
   if (fromUrl) return fromUrl;
   return `src:${m.sourceId}:${sha256(m.url + "\u0001" + m.title).slice(0, 32)}`;
+}
+
+/** Shared URL lookup for collection, external reports and administration. Historical WeChat keys
+ * included sn; reuse the earliest stored post without rewriting its public id or access URL.
+ * A browser-verified access URL also joins a short-only import to its confirmed publisher ID. */
+export async function materialIdentityForUrl(url: string, db: Db = sql, verifiedAccessUrl?: string): Promise<string | null> {
+  const key = identityKeyForUrl(url), normalized = normalizeUrl(url);
+  if (!key || !normalized) return key;
+  const u = new URL(normalized);
+  if (u.hostname !== "mp.weixin.qq.com" || u.username || u.password || !/^\/s(?:\/[^/]+)?$/.test(u.pathname)) return key;
+  const access = new URL(verifiedAccessUrl ?? normalized);
+  const post = wechatPostUrl(normalized), short = access.pathname.startsWith("/s/") ? access.origin + access.pathname : null;
+  const [known] = await db<{ identity_key: string }[]>`SELECT identity_key FROM (
+    SELECT identity_key, discovered_at, id FROM articles
+      WHERE identity_key IN (${key}, ${`url:${normalized}`}) OR url IN (${url}, ${normalized}, ${verifiedAccessUrl ?? null})
+    UNION ALL
+    SELECT identity_key, discovered_at, id FROM articles
+      WHERE ${post}::text IS NOT NULL AND starts_with(identity_key, 'url:https://mp.weixin.qq.com/s?__biz=')
+        AND identity_key NOT LIKE '%#%' AND split_part(identity_key, '&sn=', 1) = ${post ? `url:${post}` : null}
+    UNION ALL
+    SELECT identity_key, discovered_at, id FROM articles
+      WHERE ${short}::text IS NOT NULL AND starts_with(url, 'https://mp.weixin.qq.com/s/')
+        AND split_part(split_part(url, '?', 1), '#', 1) = ${short}
+    UNION ALL
+    SELECT identity_key, discovered_at, id FROM articles
+      WHERE starts_with(raw->>'externalId', 'https://mp.weixin.qq.com/s?__biz=') AND raw->>'externalId' = ${post}
+  ) candidates ORDER BY discovered_at, id LIMIT 1`;
+  return known?.identity_key ?? key;
 }
 
 /**
@@ -233,7 +270,9 @@ async function upsertIn(db: Db, m: MaterialInput): Promise<MaterialResult> {
     publishedAt: m.publishedAt && Number.isFinite(m.publishedAt.getTime()) ? m.publishedAt : null,
     sourceUpdatedAt: m.sourceUpdatedAt && Number.isFinite(m.sourceUpdatedAt.getTime()) ? m.sourceUpdatedAt : null,
   };
-  const identityKey = identityKeyFor(m);
+  const requestedIdentity = identityKeyFor(m);
+  const identityKey = requestedIdentity === identityKeyForUrl(m.url)
+    ? await materialIdentityForUrl(m.url, db) ?? requestedIdentity : requestedIdentity;
   const discoveredAt = m.discoveredAt ?? new Date();
   const title = collapseWhitespace(m.title).slice(0, 1000) || m.url;
 
@@ -317,8 +356,9 @@ async function upsertIn(db: Db, m: MaterialInput): Promise<MaterialResult> {
   // otherwise start over, and a real edit reverted later is rare and loses nothing.
   const [seen] = await db`SELECT 1 FROM article_revisions WHERE article_id = ${existing!.id} AND content_hash = ${next} LIMIT 1`;
   if (!time && seen) return unchanged;
-  // Nor is the stored version with other characters lost in transit, or with them restored.
-  if (!time && sameBarringLoss(existing!.title, title) && sameBarringLoss(existing!.body_text, bodyText) && sameBarringLoss(existing!.excerpt, excerpt)) return unchanged;
+  // Nor is the stored version with other characters lost in transit, or with them restored, or with other trailing counts.
+  if (!time && sameBarringLoss(existing!.title, title) && sameBarringLoss(existing!.body_text, bodyText)
+      && (sameBarringLoss(existing!.excerpt, excerpt) || sameBarringLoss(maskTrailingCounts(existing!.excerpt), maskTrailingCounts(excerpt)))) return unchanged;
 
   const media = m.media ? sql.json(m.media as never) : null;
   await reviseMaterial(db, existing!.id, {
@@ -351,10 +391,6 @@ export async function updatePresentation(db: Db, articleId: string, next: { html
     }
   }
   await db`UPDATE articles SET body_html=${html},media=${db.json(media as never)},updated_at=now() WHERE id=${articleId}`;
-  // Every entrance shares this committed fact, including extraction outside a fetch run. A cover
-  // change alone says nothing about an earlier failure to align the original and its translation.
-  if (html !== a.body_html) await audit("system", "content.presentation.updated", `content:${articleId}`, "正文展示更新成功",
-    { revision: a.revision, htmlHash: sha256(a.body_html ?? "") }, { revision: a.revision, htmlHash: sha256(html ?? "") }, { db });
   await emit("articleChanged", { id: articleId, kind: "body", reason: "body presentation" }, db);
   return true;
 }

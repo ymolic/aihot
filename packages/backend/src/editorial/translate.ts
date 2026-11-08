@@ -3,7 +3,8 @@
 // Bodies are translated block by block (paragraphs, headings, list items, captions, table cells) so the
 // sanitised structure stays as it is. Inside a block, images and inline code never reach the model
 // (placeholders) and links keep only their text and an id; a block whose answer loses or repeats any of
-// them is asked once more, then kept in the original. Each batch is a receipt, so a re-run reuses
+// them is asked once more, closer to the original wording (rewording is what drops links), then kept in
+// the original. Each batch is a receipt, so a re-run reuses
 // answers already paid for. A translation missing any block is stored as incomplete, never as whole.
 // The post a selected X post quotes is translated too (once per quoted post, shared by every quote).
 import * as cheerio from "cheerio";
@@ -15,14 +16,14 @@ import { rebaseTranslation } from "../content/presentation.ts";
 import { chatJson } from "../providers/llm.ts";
 import { completeReceipt, failureKind, ProviderRejectedError, rejectReceivedResponse } from "../providers/receipts.ts";
 import { collapseWhitespace, isChineseText } from "../lib/text.ts";
-import { isEmptyOrLinkOnly } from "../content/posts.ts";
+import { isEmptyOrLinkOnly, xArticleBody } from "../content/posts.ts";
 import { sha256 } from "../lib/ids.ts";
 import { modelFor } from "./models.ts";
 import { shutdownSignal } from "../jobs/queue.ts";
 import { promptText, promptVersion } from "./prompts.ts";
 import { emit } from "../modules.ts";
 
-export const TRANSLATE_PROMPT_VERSION = promptVersion("translate-body", "translate-post");
+export const TRANSLATE_PROMPT_VERSION = promptVersion("translate-body", "translate-body-retry", "translate-post");
 const BATCH_CHARS = 3500;
 /** Longer bodies get their first part translated and are marked incomplete. */
 const MAX_CHARS = 60_000;
@@ -44,6 +45,8 @@ const endsRun = (error: unknown) => ["off", "budget", "busy", "outage"].includes
 
 const SYSTEM_BODY = promptText("translate-body");
 
+const SYSTEM_RETRY = promptText("translate-body-retry");
+
 const SYSTEM_POST = promptText("translate-post");
 
 export interface TranslateResult {
@@ -56,7 +59,7 @@ export interface TranslateResult {
 }
 
 /** Leaf text blocks of a sanitised body, in document order, skipping code. */
-function segmentsOf($: cheerio.CheerioAPI): Element[] {
+export function segmentsOf($: cheerio.CheerioAPI): Element[] {
   const out: Element[] = [];
   const visit = (nodes: AnyNode[]) => {
     for (const node of nodes) {
@@ -173,8 +176,8 @@ export function unshield(translated: string, s: Shielded): string | null {
 }
 
 export async function translateArticle(articleId: string): Promise<TranslateResult> {
-  const [row] = await sql<{ revision: number; channel: string; language: string | null; body_html: string | null; body_text: string | null; x_post: { text?: string } | null; title: string; selected: boolean; body_mode: string; visibility: string }[]>`
-    SELECT a.revision, p.channel, a.language, a.body_html, a.body_text, a.x_post, p.title, p.selected, p.body_mode, p.visibility
+  const [row] = await sql<{ revision: number; channel: string; language: string | null; body_html: string | null; body_text: string | null; x_post: { text?: string } | null; x_article: { text?: string; html?: string } | null; title: string; selected: boolean; body_mode: string; visibility: string }[]>`
+    SELECT a.revision, p.channel, a.language, a.body_html, a.body_text, a.x_post, a.x_article, p.title, p.selected, p.body_mode, p.visibility
     FROM publications p JOIN articles a ON a.id = p.article_id WHERE p.article_id = ${articleId}`;
   if (!row) return { articleId, status: "skipped", reason: "not published" };
   const result = (r: Omit<TranslateResult, "articleId" | "revision">): TranslateResult => ({ articleId, revision: row.revision, ...r });
@@ -185,7 +188,12 @@ export async function translateArticle(articleId: string): Promise<TranslateResu
   };
   if (!row.selected || row.visibility !== "public" || row.body_mode !== "full") return result({ status: "skipped", reason: "not a selected full-text item" });
 
-  if (row.channel === "x") {
+  // A post with a saved long article reads as an article (publication/detail.ts), so it is translated as an
+  // article's body is: the post's own words and the article as laid out (xArticleBody), never the post's
+  // introduction alone, which would stand in for the whole article.
+  const article = row.channel === "x" && row.x_article?.text ? row.x_article : null;
+  if (article && !article.html) return result({ status: "skipped", reason: "saved long article without its layout" });
+  if (row.channel === "x" && !article) {
     const text = String(row.x_post?.text ?? row.body_text ?? "").trim();
     if (isEmptyOrLinkOnly(text)) return result({ status: "skipped", reason: "no text to translate" });
     const meaningful = collapseWhitespace(text.replace(/https?:\/\/\S+/g, ""));
@@ -198,8 +206,9 @@ export async function translateArticle(articleId: string): Promise<TranslateResu
     return result({ status: "translated", segments: 1 });
   }
 
-  if (!row.body_html || isChineseText(row.body_text ?? "", row.language)) return result({ status: "skipped", reason: "no foreign-language body" });
-  const $ = cheerio.load(row.body_html, null, false);
+  const source = article ? xArticleBody(String(row.x_post?.text ?? ""), article.html!) : row.body_html;
+  if (!source || isChineseText(article ? article.text! : row.body_text ?? "", row.language)) return result({ status: "skipped", reason: "no foreign-language body" });
+  const $ = cheerio.load(source, null, false);
   const blocks = segmentsOf($);
   if (!blocks.length) return result({ status: "skipped", reason: "no translatable text" });
   // Beyond the cap, only the leading blocks are translated; the rest keep the original text.
@@ -218,10 +227,10 @@ export async function translateArticle(articleId: string): Promise<TranslateResu
   const first = await translateAll(articleId, row.revision, shielded.map((b) => b.html), SYSTEM_BODY);
   const receiptIds = [...first.receiptIds];
   const translations = restore(first.translations);
-  // Blocks whose answer dropped a link or an image are asked once more, on their own receipt.
+  // Blocks whose answer dropped a link or an image are asked once more, on their own receipt, with the retry prompt.
   const missing = translations.flatMap((t, i) => (t === null ? [i] : []));
   if (missing.length) {
-    const again = await translateAll(articleId, row.revision, missing.map((i) => shielded[i]!.html), SYSTEM_BODY, "retry");
+    const again = await translateAll(articleId, row.revision, missing.map((i) => shielded[i]!.html), SYSTEM_RETRY, "retry");
     receiptIds.push(...again.receiptIds);
     missing.forEach((i, k) => (translations[i] = again.translations[k] ? unshield(again.translations[k]!, shielded[i]!) : null));
   }
@@ -236,16 +245,18 @@ export async function translateArticle(articleId: string): Promise<TranslateResu
   if (!done) return unusable(receiptIds, "no batch translated");
   const complete = done === blocks.length;
   const html = sanitizeBody($.html());
-  await store(articleId, row.revision, row.title, html, cheerio.load(html, null, false).root().text().trim(), complete, receiptIds, row.body_html);
+  // An article's translation follows a refreshed layout of its body; a long X article's body is not articles.body_html.
+  await store(articleId, row.revision, row.title, html, cheerio.load(html, null, false).root().text().trim(), complete, receiptIds, article ? undefined : row.body_html!);
   return result({ status: complete ? "translated" : "partial", segments: done });
 }
 
-async function store(articleId: string, revision: number, title: string, html: string, text: string, complete: boolean, receiptIds: number[], sourceHtml?: string) {
+async function store(articleId: string, revision: number, title: string, html: string, text: string, complete: boolean, receiptIds: number[], sourceHtml?: string, exactSource = false) {
   // Never over a translation of a later revision (a slow run finishing after a newer one).
   await sql.begin(async (tx) => {
     // A layout refresh can finish while the model is answering the same semantic revision.
     // Serialize with material writes and attach the answer to the current presentation.
     const [current] = await tx<{ revision: number; body_html: string | null }[]>`SELECT revision,body_html FROM articles WHERE id=${articleId} FOR UPDATE`;
+    if (exactSource && (!current || current.revision !== revision || current.body_html !== sourceHtml)) throw new Error("Translation source changed; import rejected");
     if (sourceHtml !== undefined && current?.revision === revision && current.body_html !== sourceHtml) {
       html = rebaseTranslation(sourceHtml, current.body_html ?? "", html);
     }
@@ -261,6 +272,19 @@ async function store(articleId: string, revision: number, title: string, html: s
     if (changed.length) await emit("articleChanged", { id: articleId, kind: "body", reason: "body translation" }, tx);
     for (const receiptId of new Set(receiptIds)) await completeReceipt(tx, receiptId);
   });
+}
+
+/** Restore an externally generated model translation only against its exact source body.
+ * Importers keep model credentials and execution outside reader requests; publisher translations
+ * retain priority, and the original revision checks and module notifications still apply.
+ */
+export async function importBodyTranslation(input: { articleId: string; sourceHtml: string; title: string; html: string; complete: boolean }) {
+  const [row] = await sql<{ revision: number }[]>`SELECT revision FROM articles WHERE id=${input.articleId}`;
+  if (!row) throw new Error("Translation article missing");
+  const clean = sanitizeBody(input.html);
+  const text = cheerio.load(clean, null, false).root().text().trim();
+  if (!clean || !text) throw new Error("Empty translation");
+  await store(input.articleId, row.revision, input.title, clean, text, input.complete, [], input.sourceHtml, true);
 }
 
 /** A quoted post worth translating: at least a few letters beyond its links, and not already Chinese. */
@@ -279,7 +303,9 @@ export async function translateQuotes(opts: { days?: number; limit?: number; bud
   const rows = await sql<{ tweet_id: string; text: string; text_hash: string | null; own_zh: string | null }[]>`
     SELECT DISTINCT ON (q.tweet_id) q.tweet_id, a.x_post->'quoted'->>'text' AS text, qt.text_hash,
       (SELECT tr.body_text FROM articles o JOIN translations tr ON tr.article_id = o.id AND tr.lang = 'zh' AND tr.revision >= o.revision
-       WHERE o.identity_key = 'x:' || q.tweet_id AND tr.complete AND coalesce(tr.body_text, '') <> '') AS own_zh
+       WHERE o.identity_key = 'x:' || q.tweet_id AND tr.complete AND coalesce(tr.body_text, '') <> ''
+         -- A post with a saved long article is translated as that article: its translation is not the post's words.
+         AND coalesce(o.x_article->>'text', '') = '') AS own_zh
     FROM publications p JOIN articles a ON a.id = p.article_id
     CROSS JOIN LATERAL (SELECT substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)') AS tweet_id) q
     LEFT JOIN quote_translations qt ON qt.tweet_id = q.tweet_id
@@ -344,7 +370,7 @@ export async function translatePending(opts: { limit?: number; budgetMs?: number
   const started = Date.now();
   const pending = await sql<{ article_id: string; language: string | null; text: string | null }[]>`
     SELECT p.article_id,a.language,
-      CASE WHEN p.channel='x' THEN coalesce(a.x_post->>'text',a.body_text) ELSE a.body_text END AS text
+      CASE WHEN p.channel='x' THEN coalesce(nullif(a.x_article->>'text',''),a.x_post->>'text',a.body_text) ELSE a.body_text END AS text
     FROM publications p JOIN articles a ON a.id = p.article_id
     LEFT JOIN translations tr ON tr.article_id = p.article_id AND tr.lang = 'zh'
     WHERE p.selected AND p.visibility = 'public' AND p.body_mode = 'full'

@@ -5,6 +5,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { WorkOptions } from "pg-boss";
 import type { z } from "zod";
+import type { MentionTarget } from "@aihot/contracts/mentions";
 import type { Brand } from "@aihot/contracts/site";
 import type { Db } from "./db.ts";
 import type { QueueOptions } from "./jobs/queue.ts";
@@ -129,6 +130,14 @@ export interface EngineHooks {
   exitServed: (exit: string, req: FastifyRequest) => void;
 }
 
+/** A use of sources a module declares (ServerModule.sourceUses). */
+export interface SourceUse {
+  /** Its name in the admin's source list. */
+  label: string;
+  /** The longest it lets its sources wait between reads, in minutes; a faster pace of their own stays. */
+  minutes?: number;
+}
+
 /** What a topic page asks a module's part of it (publication/topics.ts loadTopicPage). */
 export interface TopicPageAsk {
   topic: Topic;
@@ -148,35 +157,9 @@ export interface JsonNotice {
   private?: boolean;
 }
 
-/** A reminder over MCP: after the server's instructions, after every tool's text and as `notice` in its structured content. */
-export interface McpNotice {
-  instructions: string;
-  text: string;
-  notice: object;
-}
-
-/** A reminder in a feed: an item ahead of the feed's own. `description` is HTML. */
-export interface FeedNotice {
-  guid: string;
-  title: string;
-  link: string;
-  description: string;
-  at: Date;
-}
-
-/**
- * A reminder for the person behind a request, which their Agent or reader passes on (it is not content),
- * asked at each exit; the first module with one gives it (requestNotice).
- */
+/** A reminder for the person behind a JSON request; the first module with one gives it. */
 export interface RequestNotices {
-  /** v1 JSON (routes/v1.ts). */
   json: (req: FastifyRequest) => JsonNotice | null;
-  /** The Agent's Markdown answers (routes/agent.ts): Markdown after the answer. */
-  agent: (req: FastifyRequest) => string | null;
-  /** MCP (routes/mcp.ts). Each distinct reminder gets a server of its own. */
-  mcp: (req: FastifyRequest) => McpNotice | null;
-  /** RSS (routes/feeds.ts), for the feed at `feedPath`. */
-  feed: (req: FastifyRequest, feedPath: string) => FeedNotice | null;
 }
 
 export interface ServerModule {
@@ -184,6 +167,8 @@ export interface ServerModule {
   name: string;
   /** Sources whose selected articles keep independent cards/seats without changing admission or event identity (publication/rules.ts, scope.ts). */
   independentSelectedSources?: readonly string[];
+  /** Another account of an independent source's author, by source id: its post gives way to the article on the same news (events/cards.ts). */
+  independentSelectedEchoes?: Readonly<Record<string, string>>;
   /** Its HTTP routes, and hooks on the app such as what to flush when it closes, registered before the engine's v1 fallbacks (apps/api/src/app.ts). */
   http?: (app: FastifyInstance) => void;
   agent?: {
@@ -197,14 +182,6 @@ export interface ServerModule {
   sitemap?: {
     /** After the stories. */
     entries?: () => Promise<SitemapEntry[]>;
-  };
-  admin?: {
-    /** Current jobs scheduled outside the worker, by their job_runs name (admin/runs.ts). */
-    currentJobs?: () => Promise<readonly string[]>;
-    /** Badges on the admin navigation, by the key its web items name (admin/navigation.ts). */
-    counts?: Record<string, () => Promise<number>>;
-    /** Its part of the admin's runs page, under its name (admin/runs.ts); its web module draws it. */
-    runs?: () => Promise<unknown>;
   };
   models?: Record<string, ModelStep>;
   /** Cron schedules (the worker). */
@@ -243,18 +220,21 @@ export interface ServerModule {
     resumed?: (sourceId: string, tx: Db) => Promise<void>;
     fetchNow?: (source: { id: string; config: Record<string, unknown> }) => Promise<Record<string, unknown>>;
   }>;
+  /**
+   * Uses of sources besides the news pipeline, by name (sources.uses, sources/uses.ts): the module reads the
+   * articles of the sources that name one itself, so nothing is collected twice.
+   */
+  sourceUses?: Record<string, SourceUse>;
   /** Lines of the Monday source-health report (operations/reports.ts), after the source counts. */
   sourceHealth?: (now: number) => Promise<string[]>;
+  /** Its pages that names in the site's own text link to, such as a model's page by the model's name (publication/mentions.ts). */
+  mentions?: () => Promise<MentionTarget[]>;
   /** Job queues of its own (jobs/queue.ts). */
   queues?: ModuleQueue[];
   /** Follow-ups (level later), after the engine's (operations/alerts.ts). */
   followUps?: (now: number) => Promise<Finding[]>;
-  /** Further hosts the site answers on, over https: MCP accepts them as Host and as a browser's Origin (routes/mcp.ts). */
-  hosts?: string[];
-  /** Reminders for the person behind a request, by exit (RequestNotices). */
+  /** Reminders for the person behind a JSON request (RequestNotices). */
   notices?: Partial<RequestNotices>;
-  /** The origin v1 links stories at while it returns one, instead of the site's (publication/links.ts: hot topics' links.story, related stories' links.api). */
-  storyOrigin?: () => string | null;
   /** More keys a feedback sender is known by; a ban under any of them holds (operations/feedback.ts). */
   feedbackKeys?: (ip: string) => string[];
 }

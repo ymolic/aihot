@@ -38,7 +38,7 @@ export function registerAdmin(app: FastifyInstance) {
   // Sources
   app.get("/api/admin/sources", adminHandler(async (req) => {
     const f = q(req);
-    return listSources({ q: f.q, kind: f.kind, health: f.health, mode: f.mode, enabled: f.enabled as "true" | "false" | undefined, page: page(req) });
+    return listSources({ q: f.q, kind: f.kind, health: f.health, mode: f.mode, use: f.use, enabled: f.enabled as "true" | "false" | undefined, page: page(req) });
   }));
   app.post("/api/admin/sources", adminHandler(async (req, _reply, admin) => createSource(body(req), actorOf(admin))));
   app.post("/api/admin/sources/preview", adminHandler(async (req) => previewSource(body(req) as never)));
@@ -68,7 +68,10 @@ export function registerAdmin(app: FastifyInstance) {
   }));
 
   // Feedback
-  app.get("/api/admin/feedback", adminHandler(async (req) => listFeedback({ status: q(req).status, q: q(req).q, page: page(req) })));
+  app.get("/api/admin/feedback", adminHandler(async (req) => {
+    const f = q(req);
+    return listFeedback({ status: f.status, kind: f.kind, idea: f.idea, q: f.q, page: page(req) });
+  }));
   app.patch("/api/admin/feedback/:id", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await updateFeedback(Number(param(req, "id")), body(req) as never, actorOf(admin)))));
   app.post("/api/admin/feedback/:id/erase", adminHandler(async (req, reply, admin) => orNotFound(req, reply, await eraseFeedback(Number(param(req, "id")), String(body(req).reason ?? ""), actorOf(admin)))));
   app.get("/api/admin/feedback/:id/screenshot", adminHandler(async (req, reply) => {

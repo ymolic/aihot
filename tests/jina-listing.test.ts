@@ -1,6 +1,7 @@
 // A listing read through Jina is a paid request of its own on every fetch, with its own receipt: a read
 // whose outcome is unknown is never sent again and is left to ops.recover, the next fetch reads the
-// listing afresh, and a page received before a storage failure stays on its receipt. A JSON listing
+// listing afresh, and a page received before a storage failure stays on its receipt. A read keyed by its
+// caller's round is paid once a round. A JSON listing
 // embedded in a page that blocks our addresses (Hark's Cloudflare) is read from Jina's rendered HTML.
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
@@ -120,6 +121,19 @@ test("a JSON listing embedded in a page is read from Jina as rendered HTML", asy
   assert.equal((await sql`SELECT 1 FROM receipts WHERE subject = ${`source:${id}`} AND service = 'jina'`).length, 1);
 });
 
+test("a read keyed by its caller's round is paid once a round: a retry reuses it, the next round reads afresh", async () => {
+  mode = "page";
+  const before = hits;
+  const read = (round: string) => jinaRead("https://example.org/news/", { purpose: "test.round", subject: `round:${T}`, round });
+  const first = await read("r1");
+  const retry = await read("r1");
+  assert.equal(retry.receiptId, first.receiptId);
+  assert.equal(hits, before + 1, "the same round is paid once");
+  const next = await read("r2");
+  assert.notEqual(next.receiptId, first.receiptId);
+  assert.equal(hits, before + 2);
+});
+
 // A paid page can arrive before a database error: it is saved on the fetch's receipt before anything is
 // stored, so the failure loses nothing that was paid for, and the next fetch reads the listing as usual.
 test("a listing page received before a storage failure stays on its receipt", async () => {
@@ -141,7 +155,10 @@ test("a listing page received before a storage failure stays on its receipt", as
   assert.equal(hits, before + 2);
 });
 
-test("each admin preview is a paid read of its own", async () => {
+// Two reads can see the same clock reading: a CI VM's clock steps back (Check run 39178263522 reused one
+// preview's receipt for the next).
+test("each admin preview is a paid read of its own, even at the same clock reading", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const before = hits;
   assert.equal((await previewStoredSource(SOURCE))!.count, 1);
   assert.equal((await previewStoredSource(SOURCE))!.count, 1);

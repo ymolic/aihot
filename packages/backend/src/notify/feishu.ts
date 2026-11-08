@@ -1,7 +1,10 @@
 // Feishu delivery. Two separate apps: the login app (admin OAuth) and the message app (internal
-// feedback chat, operations alert chat, image upload). Content groups use custom bot webhooks.
-// Alerts and feedback never go to content groups, and content never goes to internal chats.
+// feedback chat, operations alert chat, image upload). Content groups use custom bot webhooks, and so do
+// alerts when FEISHU_ALERT_WEBHOOK_URL is set (they are plain text; feedback screenshots need the app).
+// Alerts and feedback never go to content groups, and content never goes to internal chats. What the owner is
+// told (sendAlert) goes first to Agent 自动化中台, which passes it on.
 // Everything outward is off unless explicitly enabled (development and tests stay silent).
+import { createHash } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
 import path from "node:path";
 import { beijingStamp } from "@aihot/contracts/time";
@@ -83,6 +86,27 @@ export interface Finding {
   since?: Date;
   /** New evidence after a dated closure reopens a source follow-up under the same key. */
   observedAt?: Date;
+  /**
+   * The owner hears of it at once even while an agent takes the alerts (operations/alerts.ts): only the owner
+   * can act (paying, renewing, a device beside them), or what would act has stopped (the whole site, the
+   * machine the agent runs on, the channel to the agent). "only": nothing in it is the agent's to do (a
+   * top-up), so the agent is not woken for it.
+   */
+  owner?: true | "only";
+  /**
+   * The agent is the one to act: whenever the owner is messaged about it, the agent is woken first and the
+   * message says so instead of asking him to pass it on (operations/alerts.ts).
+   */
+  agentFirst?: true;
+  /**
+   * Do not message the owner, including when it clears or when a follow-up is derived from the handoff.
+   * On the incident itself it is now or today and is woken: a later finding is not. One such key is one
+   * occurrence, so the wake's event id is the key, not a time. The derived follow-up keeps the flag and
+   * stays on the ops list only.
+   */
+  agentOnly?: true;
+  /** The hub event type of such a wake, so each kind of agent-only work is its own line there; `alert.review` when unset. */
+  agentType?: `alert.${string}`;
 }
 
 const MARK: Record<Exclude<Level, "later">, string> = { now: "🔴", today: "🟠" };
@@ -103,11 +127,22 @@ export function formatAlert(f: Finding, since: Date, now: number, repeat = false
   return { title: `${MARK[level]} ${repeat ? "仍未恢复：" : ""}${f.title}${lasting}`, lines: lines.filter((l): l is string => !!l) };
 }
 
+/** A problem handed to the agent that keeps coming back: told once, with no recovery to follow. */
+export function formatReturn(f: Finding, count: number): { title: string; lines: string[] } {
+  const level = f.level === "later" ? "today" : f.level;
+  const lines = [f.impact && `影响：${f.impact}`, "会自己好吗：每次都交给 AI 处理好了，但又出现，说明还没修到根上", "你需要：让 AI 查清它为什么反复出现，不只处理这一次"];
+  return { title: `${MARK[level]} 反复出现：${f.title}（一天内第 ${count} 次）`, lines: lines.filter((l): l is string => !!l) };
+}
+
 export function formatRecovery(title: string, since: Date, now: number): { title: string; lines: string[] } {
   return { title: `✅ 已恢复：${title}`, lines: [`持续 ${duration(now - since.getTime())}（${beijingStamp(since)} 起）`] };
 }
 
-/** Operations alert: the alert chat, falling back to the internal feedback chat — never a content group. */
+/**
+ * What the owner is told: through Agent 自动化中台 when the hub is set up; when it isn't, or doesn't take
+ * it (it restarts on every release), the alert group's bot webhook, else the alert chat, falling back to the
+ * internal feedback chat — never a content group.
+ */
 export async function sendAlert(title: string, lines: string[]): Promise<"sent" | "disabled"> {
   // Production needs no label; any other environment that has sending on says which one it is.
   const text = `${config.environmentName === "production" ? "" : `【${config.environmentName}】`}${title}\n${lines.join("\n")}`;
@@ -115,10 +150,94 @@ export async function sendAlert(title: string, lines: string[]): Promise<"sent" 
     console.log(JSON.stringify({ level: "warn", msg: "alert (not sent: FEISHU_INTERNAL_ENABLED is off)", title, lines }));
     return "disabled";
   }
+  const rest = await toldThroughHub(webhookPieces(text));
+  if (!rest.length) return "sent";
+  const webhook = credential("integrations", "FEISHU_ALERT_WEBHOOK_URL");
+  if (webhook) {
+    for (const piece of rest) {
+      const result = await webhookTurn(() => sendWebhook(webhook, { msg_type: "text", content: { text: piece } }));
+      if (result.status !== "sent") throw new Error(`feishu alert webhook ${result.status}: ${result.body}`);
+    }
+    return "sent";
+  }
   const chat = credential("integrations", "FEISHU_ALERT_CHAT_ID") ?? credential("integrations", "FEISHU_INTERNAL_CHAT_ID");
   if (!chat) return "disabled";
-  await sendToChat(chat, "text", { text });
+  await sendToChat(chat, "text", { text: rest.join("") });
   return "sent";
+}
+
+/**
+ * Hands the pieces to the hub's /tell with the source key, each under its own message key. The pieces it didn't take,
+ * from the first it refused or couldn't be reached for, which go to the group instead.
+ */
+async function toldThroughHub(pieces: string[]): Promise<string[]> {
+  const hub = credential("integrations", "WEBHOOK_HUB_URL");
+  const key = credential("integrations", "WEBHOOK_HUB_KEY");
+  if (!hub || !key) return pieces;
+  const id = `alert-${Date.now()}-${createHash("sha256").update(pieces.join("")).digest("hex").slice(0, 12)}`;
+  for (const [i, piece] of pieces.entries()) {
+    try {
+      const res = await fetch(new URL("/tell", hub), {
+        method: "POST", redirect: "error", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+        body: JSON.stringify({ key: `${id}-${i}`, text: piece }), signal: AbortSignal.timeout(15_000),
+      });
+      if (res.status !== 200) throw new Error(`HTTP ${res.status}`);
+    } catch (error) {
+      console.error(JSON.stringify({ level: "warn", msg: "alert not taken by the hub; the rest sent to the alert group", taken: i, error: String(error) }));
+      return pieces.slice(i);
+    }
+  }
+  return [];
+}
+
+// A custom bot takes at most 5 requests a second, 100 a minute and 20 KB a request (Feishu's custom bot
+// guide); the app's text messages took 150 KB. One check can send many alerts, and the digests are long.
+const WEBHOOK_GAP_MS = 600;
+const WEBHOOK_TEXT_BYTES = 18_000;
+let webhookQueue: Promise<void> = Promise.resolve();
+let webhookLast = -Infinity;
+
+/**
+ * One request at a time, sent the gap after the last one was answered or failed: Feishu got that one before
+ * it answered, so however late a timer, a request or an answer, it never gets two closer than the gap.
+ */
+function webhookTurn<T>(send: () => Promise<T>): Promise<T> {
+  const turn = webhookQueue.then(async () => {
+    // Checked again after the timer, which can fire a millisecond early by this clock.
+    let wait: number;
+    while ((wait = webhookLast + WEBHOOK_GAP_MS - performance.now()) > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    try {
+      return await send();
+    } finally {
+      webhookLast = performance.now();
+    }
+  });
+  webhookQueue = turn.then(() => undefined, () => undefined);
+  return turn;
+}
+
+/** Bytes the text takes in the request body, where quotes, backslashes and line breaks are escaped. */
+const jsonBytes = (text: string) => Buffer.byteLength(JSON.stringify(text)) - 2;
+
+/** The text in pieces that fit a request, cut after a line where one fits; joined they are the text. */
+function webhookPieces(text: string): string[] {
+  const pieces: string[] = [];
+  let rest = text;
+  while (jsonBytes(rest) > WEBHOOK_TEXT_BYTES) {
+    let end = 0;
+    let bytes = 0;
+    for (const ch of rest) {
+      bytes += jsonBytes(ch);
+      if (bytes > WEBHOOK_TEXT_BYTES) break;
+      end += ch.length;
+    }
+    const line = rest.lastIndexOf("\n", end - 1);
+    if (line > 0) end = line + 1;
+    pieces.push(rest.slice(0, end));
+    rest = rest.slice(end);
+  }
+  pieces.push(rest);
+  return pieces;
 }
 
 /** A screenshot that still cannot be uploaded this long after the feedback is given up: the text goes without it. */
@@ -186,20 +305,30 @@ export async function forwardFeedbackToFeishu(id: number): Promise<"sent" | "dis
 }
 
 /** Custom-bot webhook for content groups (selected cards and other pushes). */
-export async function postWebhook(url: string, card: unknown): Promise<{ status: "sent" | "failed" | "unknown"; body: string }> {
+export function postWebhook(url: string, card: unknown): Promise<{ status: "sent" | "failed" | "unknown"; body: string }> {
+  return sendWebhook(url, { msg_type: "interactive", card });
+}
+
+/**
+ * POST a custom-bot message and read the acknowledgement. `code` picks the bot's result code (0 = accepted)
+ * from its JSON answer; the other bots (notify/dingtalk.ts) differ only there.
+ */
+export async function sendWebhook(
+  url: string, message: unknown,
+  code: (json: Record<string, unknown> | null) => unknown = (json) => json?.code ?? json?.StatusCode,
+): Promise<{ status: "sent" | "failed" | "unknown"; body: string }> {
   const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ msg_type: "interactive", card }),
+    body: JSON.stringify(message),
     signal: AbortSignal.timeout(15_000),
   });
   const body = await res.text();
   // A successful HTTP transport is not an acknowledgement: proxies can return HTML or empty JSON.
   let status: "sent" | "failed" | "unknown" = res.status >= 400 && res.status < 500 ? "failed" : "unknown";
   try {
-    const json = JSON.parse(body) as { code?: number; StatusCode?: number } | null;
-    const code = json?.code ?? json?.StatusCode;
-    if (res.ok && typeof code === "number") status = code === 0 ? "sent" : "failed";
+    const result = code(JSON.parse(body) as Record<string, unknown> | null);
+    if (res.ok && typeof result === "number") status = result === 0 ? "sent" : "failed";
   } catch {
     // non-JSON body
   }

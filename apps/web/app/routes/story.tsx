@@ -4,11 +4,14 @@ import { Link, useLoaderData, useLocation } from "react-router";
 import type { Route } from "./+types/story";
 import type { StoryDetail, StoryReportView } from "@aihot/contracts/site";
 import { SITE } from "@aihot/site";
+import { linkMentions } from "@aihot/contracts/mentions";
+import { addressRuns } from "@aihot/contracts/addresses";
+import { MentionText } from "../components/ui/MentionText";
 import { cachedPage, loadOr404 } from "../lib/api.server";
 import { pageReuse } from "../lib/page-reuse";
 import { breadcrumbLd, pageMeta, storyLd, titled } from "../lib/seo";
-import { beijingTime, monthDay } from "@aihot/contracts/time";
-import { byBeijingDay, monthDayTime, relativeTime } from "../lib/format";
+import { beijingTime } from "@aihot/contracts/time";
+import { byBeijingDay, monthDay, monthDayTime, relativeTime } from "../lib/format";
 import { useCurrentSection } from "../lib/motion";
 import { HeatChart } from "../features/story/HeatChart";
 import { sessionCache } from "../lib/session-cache";
@@ -113,7 +116,7 @@ function TimelineRow({ r }: { r: StoryReportView }) {
         {r.summary && (
           <>
             <p ref={ref} className={`mt-1 text-[14px] leading-[1.75] text-ink-3 ${open ? "" : "line-clamp-2"}`}>
-              {r.summary}
+              <MentionText runs={addressRuns(r.summary)} />
             </p>
             {(clamped || open) && (
               <button type="button" onClick={() => setOpen(!open)} aria-expanded={open} className="mt-1 text-[12.5px] text-note transition-colors hover:text-accent">
@@ -176,6 +179,7 @@ export default function StoryPage() {
       : story.excerpt
         ? { label: "报道摘要", text: story.excerpt.text, note: `摘自 ${story.excerpt.sourceName}` }
         : null;
+  const [overviewRuns] = useMemo(() => linkMentions([overview?.text], story.mentions), [overview?.text, story.mentions]);
   const showOfficial = () => {
     setFilter("official");
     goSection(SECTIONS.reports);
@@ -231,13 +235,13 @@ export default function StoryPage() {
         />
       </div>
 
-      <div className="mt-5 grid grid-cols-[minmax(0,1fr)] items-start gap-4 lg:mt-6 lg:grid-cols-[minmax(0,1fr)_300px] lg:gap-6 2xl:grid-cols-[minmax(0,1fr)_340px]">
-        {/* On phones the main column dissolves so the rail's cards can sit between its sections. */}
-        <div className="contents lg:flex lg:min-w-0 lg:flex-col lg:gap-6">
+      <div className="mt-5 grid grid-cols-[minmax(0,1fr)] items-start gap-4 lg:mt-6 lg:gap-6 side:grid-cols-[minmax(0,1fr)_300px] 2xl:grid-cols-[minmax(0,1fr)_340px]">
+        {/* Below side (phones and narrow desktops) the main column dissolves so the rail's cards can sit between its sections. */}
+        <div className="contents side:flex side:min-w-0 side:flex-col side:gap-6">
           <Panel id={SECTIONS.overview} title="先了解这件事" right={overview?.label} className="order-1">
             {overview ? (
               <>
-                <p className="whitespace-pre-line text-[15px] leading-[1.85] text-ink-2">{overview.text}</p>
+                <p className="whitespace-pre-line text-[15px] leading-[1.85] text-ink-2"><MentionText runs={overviewRuns} /></p>
                 {overview.note && (
                   <p className="mt-2 text-[12px] text-ink-4" suppressHydrationWarning>
                     {overview.note}
@@ -359,7 +363,7 @@ export default function StoryPage() {
           )}
         </div>
 
-        <aside className="order-2 flex min-w-0 flex-col gap-4 lg:order-none lg:gap-5">
+        <aside className="order-2 flex min-w-0 flex-col gap-4 lg:gap-5 side:order-none">
           {observed && (
             <RailCard title="为什么热">
               <p className="text-[12.5px] leading-[1.75] text-ink-3">
@@ -412,7 +416,7 @@ export default function StoryPage() {
               </div>
             </RailCard>
           )}
-          <RailCard title="事件记录" className="hidden lg:block">
+          <RailCard title="事件记录" className="hidden side:block">
             <dl className="space-y-2 text-[12.5px]">
               {story.firstReportAt && (
                 <div className="flex justify-between gap-3">

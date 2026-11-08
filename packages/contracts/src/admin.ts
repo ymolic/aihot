@@ -1,6 +1,30 @@
 // Admin API (/api/admin/*): what each back-office endpoint returns, shared by the api's admin
 // functions and the admin pages. Only administrators reach it; it changes with the admin UI and is
 // never a public contract. Rows mirror their SQL columns (snake_case); timestamps are ISO strings.
+import { ADMIN } from "@aihot/site";
+
+/** Where signing in leads when the visitor was not headed anywhere: the admin pages, on a site that has them. */
+export const SIGN_IN_HOME = ADMIN ? "/admin" : "/";
+
+/**
+ * A path on this site to go to after signing in; anything else (other hosts, protocol-relative, schemes) is
+ * SIGN_IN_HOME. So is a path too long for a Location header: a reverse proxy's default response header buffer
+ * is a few kilobytes, and an overflowing response is an error page.
+ */
+export function safeReturn(target: string): string {
+  try {
+    // A proxy's login redirect may pass the whole original URL; only its path and query count.
+    const path = /^https?:\/\//i.test(target) ? ((u) => `${u.pathname}${u.search}`)(new URL(target)) : target;
+    // The URL parser drops tabs and newlines and reads a backslash as a slash, as browsers do.
+    const u = new URL(path, "http://return.invalid");
+    const kept = `${u.pathname}${u.search}`;
+    // Check what is returned, not only what came in: resolved dot segments can leave "//" in front.
+    const here = (p: string) => new URL(p, "http://return.invalid").host === "return.invalid";
+    return path.startsWith("/") && here(path) && here(kept) && kept.length <= 2000 ? kept : SIGN_IN_HOME;
+  } catch {
+    return SIGN_IN_HOME;
+  }
+}
 
 declare const iso: unique symbol;
 
@@ -38,8 +62,8 @@ export interface AdminRerun {
   version?: string;
 }
 
-/** Items waiting for the admin, shown on the navigation: the engine's, and the modules' under their own keys. */
-export type AdminNavCounts = Partial<Record<"feedback" | "sources" | "runs", number>> & Record<string, number | undefined>;
+/** Items waiting for the admin, shown on the navigation. */
+export type AdminNavCounts = Partial<Record<"feedback" | "sources" | "runs", number>>;
 
 /** One manual change (audit_log), as a history list shows it. */
 export interface AdminAuditEntry {
@@ -68,7 +92,7 @@ export const REPLACEABLE_SOURCE_KINDS = ["rss", "web_list", "json_list"] as cons
 export type ReplaceableSourceKind = typeof REPLACEABLE_SOURCE_KINDS[number];
 
 export interface AdminSourceUpdate {
-  patch: Partial<Pick<AdminSource, "name" | "enabled" | "interval_minutes" | "tier" | "participation_mode" | "signal_group_id" | "first_party" | "owner_entity_id" | "site_fulltext" | "syndicate_fulltext" | "tags">> & (
+  patch: Partial<Pick<AdminSource, "name" | "enabled" | "interval_minutes" | "tier" | "selection_class" | "participation_mode" | "signal_group_id" | "first_party" | "owner_entity_id" | "site_fulltext" | "syndicate_fulltext" | "tags" | "uses">> & (
     { kind?: never; config?: Record<string, unknown> } | { kind: ReplaceableSourceKind; config: Record<string, unknown> }
   );
   version: string;
@@ -80,7 +104,9 @@ export interface AdminSourceRow {
   name: string;
   kind: string;
   tier: string;
+  selection_class: string | null;
   participation_mode: string;
+  uses: string[];
   enabled: boolean;
   health: string;
   fail_count: number;
@@ -98,6 +124,8 @@ export interface AdminSources {
   page: number;
   rows: AdminSourceRow[];
   totals: { total: number; enabled: number; failing: number; degraded: number };
+  /** The uses the installed modules declare, by name: what the admin calls each. */
+  useLabels: Record<string, string>;
 }
 
 export interface AdminSource {
@@ -109,7 +137,11 @@ export interface AdminSource {
   first_party: boolean;
   owner_entity_id: string | null;
   tier: string;
+  /** A class of the industry pack's selection rules (industry/selection.ts): raises the tier's threshold. */
+  selection_class: string | null;
   participation_mode: string;
+  /** Uses besides the news pipeline, each declared by an installed module. */
+  uses: string[];
   signal_group_id: string | null;
   interval_minutes: number;
   site_fulltext: boolean;
@@ -130,13 +162,15 @@ export interface AdminSourceDetail {
   source: AdminSource;
   runs: Array<{
     id: number; started_at: Timestamp; finished_at: Timestamp | null; status: string; found_count: number | null; new_count: number | null; error: string | null;
-    detail: { pages?: number; backlog?: number; dropped?: number; presentationFailures?: Array<{ url: string; error: string }> } | null;
+    detail: { pages?: number; backlog?: number; dropped?: number } | null;
   }>;
   items: Array<{ id: string; title: string; url: string; discovered_at: Timestamp; published_at: Timestamp | null; processing_state: string; selected: boolean | null; visibility: string | null; title_zh: string | null }>;
   stats: { total: number; last7d: number; selected: number };
   history: AdminAuditEntry[];
   /** Progress of the re-derivation queued after the last change of licences, tier or participation. */
   republish: Record<string, unknown> | null;
+  /** The uses the installed modules declare, by name: what the admin calls each. */
+  useLabels: Record<string, string>;
 }
 
 /** Creating a source: refused as a duplicate of an existing one, or created. */
@@ -241,6 +275,10 @@ export interface AdminFeedbackRow {
   screenshot: "local" | "feishu" | "gone" | null;
   source_hash: string;
   status: string;
+  /** bug, suggestion, question or other; null until handled. */
+  kind: string | null;
+  /** For a suggestion, the idea it asks for (the name its pool entry goes by). */
+  idea: string | null;
   note: string | null;
   forwarded_at: Timestamp | null;
   forward_error: string | null;
@@ -254,7 +292,11 @@ export interface AdminFeedbackRow {
 export interface AdminFeedback {
   page: number;
   rows: AdminFeedbackRow[];
+  /** All feedback by status, and the handled ones by kind. */
   counts: Record<string, number>;
+  kinds: Record<string, number>;
+  /** The suggestion pool, most asked first: how many senders asked for each idea, spam left out. */
+  ideas: Array<{ idea: string; people: number }>;
   bans: Array<{ source_hash: string; reason: string | null; created_by: string | null; created_at: Timestamp; expires_at: Timestamp | null }>;
 }
 
@@ -306,8 +348,6 @@ export interface AdminRuns {
   errors: Array<{ error: string; n: number; last: Timestamp; example: string }>;
   retrying: { count: number; next: Timestamp | null };
   ingest: Array<{ client: string; kind: string; status: string; error: string | null; summary: unknown; created_at: Timestamp }>;
-  /** Each module's part of the page, under its name (what its server module's admin.runs returns). */
-  modules: Record<string, unknown>;
 }
 
 // Settings
@@ -363,7 +403,7 @@ export interface AdminModelUsage {
 
 export interface AdminModels {
   days: number;
-  capabilities: Array<{ key: string; label: string; env: string; defaultModel: string; vision: boolean; current: { model: string; source: "admin" | "env" | "default" }; fallback: { model: string; primaryPaused: boolean; backupPaused: boolean; nextProbeAt: string | null } | null; usage: AdminModelUsage[] }>;
+  capabilities: Array<{ key: string; label: string; env: string; defaultModel: string; vision: boolean; current: { model: string; source: "admin" | "env" | "default"; invalid?: string }; fallback: { model: string; primaryPaused: boolean; backupPaused: boolean; nextProbeAt: string | null } | null; usage: AdminModelUsage[] }>;
   choices: Array<{ key: string; service: string; vision: boolean }>;
   history: Array<{ at: Timestamp; actor: string; subject: string; reason: string | null; before: { model: string; source: string } | null; after: { model: string; source: string } | null }>;
   benches: Array<{ id: string; label: string; sample_size: number; prompt_version: string | null; models: string[]; created_at: Timestamp }>;

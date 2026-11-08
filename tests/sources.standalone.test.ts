@@ -54,6 +54,9 @@ const pages: Record<string, () => string> = {
   "/en/post": () => article("Improved token efficiency", "Agents now finish longer runs with fewer tokens. ".repeat(8)),
   "/zh/post": () => article("提升 token 效率", "智能体现在能用更少的 token 完成更长的运行。".repeat(12)),
   "/en/feed.xml": () => `<rss version="2.0"><channel><item><title>Improved token efficiency</title><link>${site}/en/post</link><pubDate>Wed, 23 Sep 2026 12:00:00 GMT</pubDate></item></channel></rss>`,
+  // liquid.ai/blog/lfm3 was 8.7 MB: the framework inlines the whole page payload again as script.
+  "/large/post": () => article("LFM3", `Benchmarks for the new models. ${"Each row compares the same task. ".repeat(12)}</p><table><tr><th>Benchmark</th><th>LFM3</th></tr><tr><td><p>LiveClaw</p></td><td><p>45.60</p></td></tr></table><p>`)
+    .replace("</body>", `<script>${"x".repeat(9 * 1024 * 1024)}</script></body>`),
   "/en/items.json": () => JSON.stringify([{ title: "Improved token efficiency", url: `${site}/en/post` }]),
 };
 function article(title: string, text: string) {
@@ -164,9 +167,12 @@ test("feed text that only teases the article is a summary: the page is fetched b
   assert.equal(teaser!.excerpt, "AMD announced today that it's acquiring World Labs.");
   assert.equal(whole!.bodyStatus, "ok");
   assert.ok(whole!.bodyText!.length > 1200);
-  // Discussion sources only need what the feed says.
-  const signal = await fetchRss({ id: "test-feed", config: { feedUrl: `${site}/teaser.xml` }, participation_mode: "hot_signal", cursor: null } as never, { force: true });
+  // Discussion sources only need what the feed says; one a module reads (sources.uses) is read whole.
+  const signal = await fetchRss({ id: "test-feed", config: { feedUrl: `${site}/teaser.xml` }, participation_mode: "hot_signal", uses: [], cursor: null } as never, { force: true });
   assert.equal(signal.candidates[0]!.bodyStatus, "ok");
+  const used = await fetchRss({ id: "test-feed", config: { feedUrl: `${site}/teaser.xml` }, participation_mode: "isolated", uses: ["free-tokens"], cursor: null } as never, { force: true });
+  assert.equal(used.candidates[0]!.bodyStatus, "pending");
+  assert.equal(used.candidates[0]!.bodyText, null);
 });
 
 test("a source that declares its feed summary the body keeps a short one, in RSS and Atom; a teaser is still a summary", async () => {
@@ -180,6 +186,9 @@ test("a source that declares its feed summary the body keeps a short one, in RSS
     assert.deepEqual([declared!.bodyStatus, declared!.bodyText, declared!.excerpt], ["ok", note, note], `${path}: declared, it is the body`);
   }
   assert.equal((await read("/teaser.xml", true))[0]!.bodyStatus, "pending", "a teaser still asks for the page");
+  const alternate = await fetchRss({ id: "test-feed", config: { feedUrl: `${site}/teaser.xml`, detail: { bodyUrlSuffix: ".patch" } }, participation_mode: "isolated", uses: ["free-tokens"], cursor: null } as never, { force: true });
+  assert.ok(alternate.candidates.length);
+  assert.ok(alternate.candidates.every((c) => c.bodyStatus === "pending"), "an explicit body alternate also replaces long commit summaries");
 });
 
 test("hidden page parts are dropped whole, and a news page's closing blocks are trimmed", () => {
@@ -271,6 +280,12 @@ test("a source's language reaches its listing, detail page and article body, whi
   await fetchWebList(source(listing));
   assert.match(sent("/en/blog") ?? "", /^zh-CN/);
   assert.match((await extractFromUrl(item!.url, "article:fixture", pageRules({})))?.text ?? "", /^智能体/);
+});
+
+test("a page of several megabytes is read directly, keeping its tables", async () => {
+  const body = await extractFromUrl(`${site}/large/post`, "article:fixture", {}, { paidFallback: false });
+  assert.equal(body?.via, "readability");
+  assert.match(body?.html ?? "", /<table>.*LiveClaw.*45\.60.*<\/table>/s);
 });
 
 test("a source's language is an Accept-Language value, refused by kinds that read no pages", () => {

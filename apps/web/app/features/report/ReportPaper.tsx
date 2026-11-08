@@ -6,10 +6,12 @@
 // and the neighbours; line parts stories, columns and list rows. Nothing is set in solid ink. Stories
 // sit in rows of two whose rules run across the page, each story as tall as its neighbour.
 import { IntentLink } from "../../components/ui/IntentLink";
-import { useState, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import { REPORT_NAMES, type ReportCitation, type ReportDetail, type ReportNavigationEntry } from "@aihot/contracts/site";
 import { REPORTS, SITE, subjectAfter, withSubject } from "@aihot/site";
+import { linkMentions, type MentionRun } from "@aihot/contracts/mentions";
+import { MentionText } from "../../components/ui/MentionText";
 import { Badge } from "../../components/ui/Badge";
 import { IconArrowLeft, IconArrowRight, IconArrowUpRight } from "../../components/icons";
 import { Kicker } from "../../components/ui/Kicker";
@@ -18,7 +20,8 @@ import { SourceAvatar } from "../../components/ui/SourceAvatar";
 import { Halftone } from "./Halftone";
 import { Nameplate } from "./Nameplate";
 import { IssueDots } from "./IssueDots";
-import { monthDay } from "@aihot/contracts/time";
+import { Picture } from "../../components/ui/Picture";
+import { monthDay } from "../../lib/format.ts";
 import { EDITION, MOTTO, dateLine, dateMark, headline, metricItems, neighbourLabel, reportPath, shortDay } from "./format";
 
 const pad = (n: number) => String(n).padStart(2, "0");
@@ -135,14 +138,16 @@ function Related({ items, className = "" }: { items: ReportCitation[]; className
 function Coverage({ c }: { c: ReportCitation }) {
   return (
     <>
-      {!!c.otherSources && <span className="shrink-0 text-ink-4">另外 {c.otherSources} 家也报道了</span>}
+      {!!c.otherSources && (c.storyId
+        ? <IntentLink viewTransition to={`/story/${c.storyId}`} className="shrink-0 text-ink-4 transition-colors hover:text-accent">另外 {c.otherSources} 家也报道了</IntentLink>
+        : <span className="shrink-0 text-ink-4">另外 {c.otherSources} 家也报道了</span>)}
       {c.followUp && <Badge title={`${monthDay(c.followUp)}的日报报道过这件事，这里是新进展`}>跟进</Badge>}
     </>
   );
 }
 
 /** One story: source, headline, at most four lines of summary, and the original at the foot. */
-function Story({ c, dated, className = "" }: { c: ReportCitation; dated: boolean; className?: string }) {
+function Story({ c, slot, dated, className = "" }: { c: ReportCitation; slot: string; dated: boolean; className?: string }) {
   return (
     <article id={anchorOf(c) ?? undefined} className={`flex min-w-0 scroll-mt-[calc(var(--bar-h)+1.5rem)] flex-col py-6 ${className}`}>
       <div className="flex items-center gap-2 text-[12px] text-ink-3">
@@ -161,7 +166,7 @@ function Story({ c, dated, className = "" }: { c: ReportCitation; dated: boolean
               c.title
             )}
           </h3>
-          {c.summary && <p className="mt-2 line-clamp-4 text-[15px] leading-[1.85] text-ink-2 @[560px]:text-justify">{c.summary}</p>}
+          {c.summary && <p className="mt-2 line-clamp-4 text-[15px] leading-[1.85] text-ink-2 @[560px]:text-justify"><Prose slot={slot} text={c.summary} /></p>}
           {!!c.related?.length && <Related items={c.related} className="mt-3" />}
           <div className="mt-auto pt-3">
             <Original c={c} />
@@ -212,6 +217,19 @@ function leadStoryOf(report: ReportDetail): ReportCitation | null {
 
 const WITHDRAWN_NOTE = "该内容已按来源方要求下架或调整展示方式。";
 
+/** The paragraph under the front page's headline: a daily's lead, a weekly or monthly's leading event or overview. */
+function dekOf(report: ReportDetail, leadStory: ReportCitation | null): string | null {
+  return report.kind === "daily" || !leadStory ? (report.lead?.leadParagraph ?? leadStory?.summary ?? report.overview) : leadStory.summary;
+}
+
+/** The issue's own paragraphs with the names they link, by where each stands (ReportPaper). */
+const Linked = createContext<ReadonlyMap<string, MentionRun[]>>(new Map());
+
+function Prose({ slot, text }: { slot: string; text: string }) {
+  const runs = useContext(Linked).get(slot);
+  return runs ? <MentionText runs={runs} /> : text;
+}
+
 /**
  * Sections as pages. A story cited twice appears once, and
  * the story leading the front page is not repeated inside.
@@ -244,8 +262,8 @@ function LeadPicture({ cover, onError, priority = false, className = "" }: { cov
   return (
     <figure className={className}>
       <div className="overflow-hidden well rounded-panel" style={{ aspectRatio: shown }}>
-        <img src={cover.url} srcSet={cover.srcSet}
-          sizes={priority ? "(min-width: 1700px) 780px, (min-width: 1580px) calc(100vw - 920px), (min-width: 1420px) calc(100vw - 880px), (min-width: 1024px) calc(100vw - 540px), (min-width: 640px) 608px, calc(100vw - 32px)" : "auto, (min-width: 1180px) 300px, (min-width: 640px) 608px, calc(100vw - 32px)"}
+        <Picture src={cover.url} srcSet={cover.srcSet}
+          sizes={priority ? "(min-width: 1700px) 780px, (min-width: 1580px) calc(100vw - 920px), (min-width: 1420px) calc(100vw - 880px), (min-width: 1176px) calc(100vw - 540px), (min-width: 1140px) calc(100vw - 600px), (min-width: 941px) calc(100vw - 260px), (min-width: 700px) calc(100vw - 144px), (min-width: 640px) 608px, calc(100vw - 32px)" :"auto, (min-width: 1180px) 300px, (min-width: 640px) 608px, calc(100vw - 32px)"}
           width={cover.width ?? undefined} height={cover.height ?? undefined}
           alt="" loading={priority ? "eager" : "lazy"} fetchPriority={priority ? "high" : "auto"} decoding="async" onError={onError} className="size-full object-cover" />
       </div>
@@ -262,7 +280,7 @@ function Overview({ text }: { text: string }) {
   return (
     <section aria-label="本期导读" className="border-b border-line py-7 @[880px]:py-9">
       <Kicker>本期导读</Kicker>
-      <p className="mt-4 max-w-[46em] text-[16.5px] leading-[1.9] text-ink-2 @[560px]:text-justify @[880px]:text-[17.5px]">{text}</p>
+      <p className="mt-4 max-w-[46em] text-[16.5px] leading-[1.9] text-ink-2 @[560px]:text-justify @[880px]:text-[17.5px]"><Prose slot="overview" text={text} /></p>
     </section>
   );
 }
@@ -278,7 +296,7 @@ function FrontPage({ report, pages, leadStory, count }: { report: ReportDetail; 
   // A landscape picture opens the lead above its headline; a squarer one sits beside the paragraph.
   const wide = !cover?.width || !cover.height || cover.width / cover.height >= 1.25;
   const title = report.lead?.title ?? leadStory?.title ?? headline(report.kind, report.key, count);
-  const dek = daily || !leadStory ? (report.lead?.leadParagraph ?? leadStory?.summary ?? report.overview) : leadStory.summary;
+  const dek = dekOf(report, leadStory);
   const highlights = report.highlights.filter((h) => !leadStory || keyOf(h) !== keyOf(leadStory)).slice(0, 3);
   const inPage = new Set(pages.flatMap((p) => p.items.map((c) => c.itemId)).filter(Boolean));
   const period = daily ? "今日" : report.kind === "weekly" ? "本周" : "本月";
@@ -301,7 +319,7 @@ function FrontPage({ report, pages, leadStory, count }: { report: ReportDetail; 
         </h2>
         {dek && (
           <div className={cover && !wide ? "order-3 mt-6 grid gap-6 @[640px]:grid-cols-[minmax(0,1fr)_minmax(0,38%)] @[880px]:mt-7" : "order-3"}>
-            <p className={`text-[16.5px] leading-[1.9] text-ink-2 @[880px]:text-[17.5px] ${cover && !wide ? "" : "mt-6 @[560px]:text-justify @[880px]:mt-7"}`}>{dek}</p>
+            <p className={`text-[16.5px] leading-[1.9] text-ink-2 @[880px]:text-[17.5px] ${cover && !wide ? "" : "mt-6 @[560px]:text-justify @[880px]:mt-7"}`}><Prose slot="dek" text={dek} /></p>
             {cover && !wide && <LeadPicture cover={cover} onError={() => setBroken(cover.url)} />}
           </div>
         )}
@@ -377,8 +395,7 @@ function FrontPage({ report, pages, leadStory, count }: { report: ReportDetail; 
 function QuietFront({ lead }: { lead: NonNullable<ReportDetail["lead"]> }) {
   return (
     <section aria-label="头版" className="pt-10 @[880px]:pt-16">
-      <Kicker>头版</Kicker>
-      <h2 className="mt-4 text-[32px] font-black leading-[1.28] tracking-[-0.03em] text-ink [text-wrap:balance] @[520px]:text-[40px] @[1040px]:text-[48px] @[1040px]:leading-[1.22]">
+      <h2 className="text-[32px] font-black leading-[1.28] tracking-[-0.03em] text-ink [text-wrap:balance] @[520px]:text-[40px] @[1040px]:text-[48px] @[1040px]:leading-[1.22]">
         {lead.title}
       </h2>
       {lead.leadParagraph && <p className="mt-6 max-w-[46em] text-[16.5px] leading-[1.9] text-ink-2 @[880px]:mt-7 @[880px]:text-[17.5px]">{lead.leadParagraph}</p>}
@@ -404,6 +421,7 @@ export function SectionPage({ id, no, label, children }: { id: string; no?: numb
 /** Two columns with a hairline between them, once the page is wide enough (快讯). */
 const COLUMNS = "@[760px]:columns-2 @[760px]:gap-x-12 @[760px]:[column-rule:1px_solid_var(--line)]";
 
+/** Issues change through these links, never by a sideways swipe: on iOS that would fight the edge swipe back. */
 function Neighbours({ report, index }: { report: ReportDetail; index: ReportNavigationEntry[] }) {
   const titleOf = (key: string) => index.find((e) => e.key === key)?.title ?? `${withSubject(REPORT_NAMES[report.kind])} · ${key}`;
   const cell = "group flex min-w-0 flex-col py-6";
@@ -473,7 +491,16 @@ export function ReportPaper({ report, index }: { report: ReportDetail; index: Re
   const count = pages.reduce((sum, p) => sum + p.items.length, 0) + (leadStory ? 1 : 0);
   // Only a daily comes out with nothing in it: a day the editors judged with nothing new (REPORTS.quiet).
   const quiet = count === 0 && report.flashes.length === 0;
+  // Each name links once in the issue, where a reader meets it first: the texts in the order they are drawn.
+  const slots: Array<[string, string | null]> = [
+    ...(!daily && leadStory ? [["overview", report.overview] as [string, string | null]] : []),
+    ["dek", dekOf(report, leadStory)],
+    ...pages.flatMap((p) => [[`page:${p.id}`, p.summary] as [string, string | null], ...p.items.map((c) => [`story:${p.id}:${keyOf(c)}`, c.available ? c.summary : null] as [string, string | null])]),
+  ];
+  const runs = linkMentions(slots.map(([, text]) => text), report.mentions);
+  const linked = new Map(slots.map(([slot], i) => [slot, runs[i]]));
   return (
+    <Linked.Provider value={linked}>
     <article className="@container [overflow-wrap:anywhere]">
       <Masthead report={report} index={index} quiet={quiet} />
       {quiet ? (
@@ -490,10 +517,10 @@ export function ReportPaper({ report, index }: { report: ReportDetail; index: Re
           {p.summary && (
             <p className="border-b border-line py-5 text-[15.5px] leading-[1.9] text-ink-2 @[560px]:text-justify">
               <span className="mr-2 font-semibold text-accent">本版导读</span>
-              {p.summary}
+              <Prose slot={`page:${p.id}`} text={p.summary} />
             </p>
           )}
-          <Rows items={p.items}>{(c, cell) => <Story key={`${p.id}-${keyOf(c)}`} c={c} dated={!daily} className={cell} />}</Rows>
+          <Rows items={p.items}>{(c, cell) => <Story key={`${p.id}-${keyOf(c)}`} c={c} slot={`story:${p.id}:${keyOf(c)}`} dated={!daily} className={cell} />}</Rows>
         </SectionPage>
       ))}
 
@@ -537,5 +564,6 @@ export function ReportPaper({ report, index }: { report: ReportDetail; index: Re
         </p>
       </footer>
     </article>
+    </Linked.Provider>
   );
 }

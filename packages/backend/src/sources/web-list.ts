@@ -1,14 +1,15 @@
 // Web list pages: HTML with selectors, Markdown through Jina Reader, and dated changelog sections.
 import * as cheerio from "cheerio";
+import { marked } from "marked";
 import { guardedFetch, languageHeaders, requireOk } from "../lib/http-fetch.ts";
-import { contentDocument } from "../lib/page-content.ts";
+import { contentDocument, UnavailablePageError } from "../lib/page-content.ts";
 import { fetchListing } from "./listing-fetch.ts";
 import { identityKeyForUrl, normalizeUrl } from "../lib/url.ts";
 import { collapseWhitespace, stripTags } from "../lib/text.ts";
-import { isSignInUrl, pagePublicationDate, pageRules, readableDocument, type ExtractedBody } from "../content/extract.ts";
+import { isSignInRedirect, isSignInUrl, pagePublicationDate, pageRules, readableDocument, type ExtractedBody } from "../content/extract.ts";
 import { sanitizeBody } from "../content/sanitize.ts";
 import { JINA_PREFIX, jinaRead } from "../providers/jina.ts";
-import { articleUtcOffset, readPublicationDate, type PublicationDate } from "./dates.ts";
+import { articleUtcOffset, readPublicationDate, readRelativeDate, type PublicationDate } from "./dates.ts";
 import { FetchError, type Candidate, type SourceRow } from "./types.ts";
 
 
@@ -18,7 +19,7 @@ function elementDate(el: ReturnType<cheerio.CheerioAPI>, utcOffset?: string): Pu
     const date = readPublicationDate(value, utcOffset);
     if (date.publishedAt) return date;
   }
-  return { publishedAt: null, publicationTime: null };
+  return readRelativeDate(el.text(), new Date(), utcOffset);
 }
 
 /** Prefix rules ignore the scheme: a Jina listing of an http:// address links its posts over http. */
@@ -261,6 +262,30 @@ function fromDocusaurusChangelog(html: string, base: string, source: SourceRow):
   return out;
 }
 
+/** Markdown documentation keeps section addresses in explicit {% id="…" %} heading annotations. */
+function fromMarkdownChangelog(markdown: string, base: string, source: SourceRow): Candidate[] {
+  const tokens = marked.lexer(markdown);
+  const out: Candidate[] = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const heading = tokens[i]!;
+    if (heading.type !== "heading" || heading.depth !== 2) continue;
+    const anchor = /\s+\{%\s*id="([\w-]+)"\s*%\}\s*$/.exec(heading.text);
+    if (!anchor) continue;
+    const title = heading.text.slice(0, anchor.index).trim();
+    let end = i + 1;
+    while (end < tokens.length) {
+      const next = tokens[end]!;
+      if (next.type === "heading" && next.depth <= 2) break;
+      end++;
+    }
+    const url = `${base.replace(/#.*$/, "")}#${anchor[1]}`;
+    if (!allowed(url, source)) continue;
+    const bodyHtml = sanitizeBody(marked.parser(tokens.slice(i + 1, end), { async: false }), base);
+    out.push({ url, title, ...readPublicationDate(title, source.config.publishedAtUtcOffset), bodyHtml, bodyText: stripTags(bodyHtml), bodyStatus: "ok" });
+  }
+  return out;
+}
+
 async function fetchScript(url: string): Promise<string> {
   return requireOk(await guardedFetch(url, { timeoutMs: 25_000 }), url).text();
 }
@@ -336,6 +361,7 @@ export async function fetchWebList(source: SourceRow): Promise<Candidate[]> {
   if (mode === "mimo_home") out = await fromMimoHome(text, base, source);
   else if (mode === "markdown") out = fromMarkdown(text, base, source);
   else if (mode === "docusaurus_changelog") out = fromDocusaurusChangelog(text, base, source);
+  else if (mode === "markdown_changelog") out = fromMarkdownChangelog(text, base, source);
   else if (mode === "intercom_changelog") out = fromIntercomChangelog(text, base, source);
   else out = fromHtml(text, base, source);
   if (out.length === 0) throw new FetchError(`no items matched (${mode})`);
@@ -369,6 +395,8 @@ export async function fetchDetail(url: string, source: SourceRow, need: DetailNe
     // The rules read a page's head and byline. A page past the size limit (a long paper with inline
     // figures) is read up to it rather than failing on every run; a body cut there is not kept.
     const res = requireOk(await guardedFetch(url, { headers: languageHeaders(source.config.acceptLanguage), timeoutMs: 20_000, truncate: true }), "detail");
+    // A sign-in form is no detail page: its title, date and text are not the post's.
+    if (isSignInRedirect(url, res.url)) throw new UnavailablePageError("redirected to a sign-in form");
     html = res.text();
     page = { document: contentDocument(html), url: res.url, whole: !res.truncated && /html/.test(res.headers.get("content-type") ?? "") };
   }
@@ -400,7 +428,7 @@ export async function fetchDetail(url: string, source: SourceRow, need: DetailNe
 
   // The body last, from the same document: Readability changes what it reads.
   let body: ExtractedBody | null = null;
-  if (need.body && page?.whole) {
+  if (need.body && page?.whole && !d.bodyUrlSuffix) {
     try { body = readableDocument(page.document, page.url, pageRules(source.config)); }
     catch { /* A failed extraction must not discard the detail metadata. */ }
   }

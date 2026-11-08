@@ -9,6 +9,7 @@ import { isoWeekRange, monthRange } from "@aihot/contracts/time";
 import { dailyUrl, itemUrl, periodUrl, siteUrl } from "./links.ts";
 import { publicSourceName } from "./rules.ts";
 import { listedCondition } from "./scope.ts";
+import { mentionsIn } from "./mentions.ts";
 
 export type { ReportKind };
 
@@ -30,15 +31,16 @@ interface Availability {
   sourceName: string | null;
   sourceIcon: string | null;
   publishedAt: Date | null;
+  storyId: string | null;
 }
 
 async function availability(ids: string[]): Promise<Map<string, Availability>> {
   const out = new Map<string, Availability>();
   if (ids.length === 0) return out;
-  const rows = await sql<{ id: string; available: boolean; summary: string | null; first_party: boolean; source_id: string; source_name: string | null; icon_url: string | null; at: Date | null }[]>`
+  const rows = await sql<{ id: string; available: boolean; summary: string | null; first_party: boolean; source_id: string; source_name: string | null; icon_url: string | null; story_id: string | null; at: Date | null }[]>`
     SELECT p.article_id AS id, (${listedCondition(new Date())}) AS available, p.summary, (s.tier = 'T1') AS first_party, p.source_id, s.name AS source_name, s.icon_url,
-      coalesce(p.published_at, p.discovered_at) AS at
-    FROM publications p LEFT JOIN sources s ON s.id = p.source_id
+      st.public_id::text AS story_id, coalesce(p.published_at, p.discovered_at) AS at
+    FROM publications p LEFT JOIN sources s ON s.id = p.source_id LEFT JOIN stories st ON st.id = p.story_id
     WHERE p.article_id IN ${sql(ids)}`;
   for (const r of rows) {
     out.set(r.id, {
@@ -49,6 +51,7 @@ async function availability(ids: string[]): Promise<Map<string, Availability>> {
       sourceName: r.source_name,
       sourceIcon: r.icon_url,
       publishedAt: r.at,
+      storyId: r.story_id,
     });
   }
   return out;
@@ -256,9 +259,10 @@ function entryCitation(raw: Record<string, any>, avail: Map<string, Availability
   const citation = citationFrom(raw, avail);
   if (!citation.available) return citation;
   const related: ReportCitation[] = (raw.related ?? []).map((r: Record<string, any>) => ({ ...citationFrom(r, avail), summary: null }));
+  const storyId = raw.itemId ? avail.get(raw.itemId)?.storyId : null;
   return {
     ...citation,
-    ...(Number(raw.sources) > 1 ? { otherSources: Number(raw.sources) - 1 } : {}),
+    ...(Number(raw.sources) > 1 ? { otherSources: Number(raw.sources) - 1, ...(storyId ? { storyId } : {}) } : {}),
     ...(related.length ? { related } : {}),
     ...(typeof raw.followUp === "string" ? { followUp: raw.followUp } : {}),
   };
@@ -360,6 +364,10 @@ export async function loadReport(kind: ReportKind, key: string): Promise<ReportD
   const [{ prev, next }, picture] = await Promise.all([neighbors(kind, key), leadItem?.itemId && leadItem.available ? leadCover(leadItem.itemId) : null]);
   const cover = picture && leadItem ? { ...picture, caption: kind === "daily" || c.leadItemId ? null : leadItem.title } : null;
   const headline = kind === "daily" ? null : periodicHeadline(c);
+  const lead = hasCitedLead
+    ? (named ? { title: named.title, leadParagraph: (kind === "daily" ? named.leadParagraph : overview) ?? "" } : null)
+    : kind === "daily" ? c.lead ?? null
+      : c.lead ? { ...c.lead, leadParagraph: overview ?? "" } : (headline ? { title: headline, leadParagraph: overview ?? "" } : null);
   const title = kind === "daily" ? `${withSubject("日报")} · ${key}`
     : String((hasCitedLead && c.title === headline ? named?.title : c.title) ?? (kind === "weekly" ? `${SITE.name} 周报 · ${key}` : `${SITE.name} 月报 · ${key}`));
   return {
@@ -368,10 +376,7 @@ export async function loadReport(kind: ReportKind, key: string): Promise<ReportD
     issueNumber: r.issue_number,
     title,
     generatedAt: r.generated_at.toISOString(),
-    lead: hasCitedLead
-      ? (named ? { title: named.title, leadParagraph: (kind === "daily" ? named.leadParagraph : overview) ?? "" } : null)
-      : kind === "daily" ? c.lead ?? null
-        : c.lead ? { ...c.lead, leadParagraph: overview ?? "" } : (headline ? { title: headline, leadParagraph: overview ?? "" } : null),
+    lead,
     leadItemId: (kind === "daily" || c.leadItemId) && leadItem?.available ? leadItem.itemId : null,
     overview,
     highlights,
@@ -386,6 +391,8 @@ export async function loadReport(kind: ReportKind, key: string): Promise<ReportD
     readingMinutes: readingMinutes(text),
     prev,
     next,
+    // The texts the issue's page draws: its lead, overview and each section's summary and stories.
+    mentions: await mentionsIn([lead?.leadParagraph, overview, ...sections.flatMap((s) => [s.summary, ...s.items.map((i) => i.summary)])]),
   };
 }
 

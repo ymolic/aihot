@@ -71,6 +71,50 @@ test("an outage is announced once, repeated hourly, and closed with one recovery
   }
 });
 
+// 10-26 16:00–19:00 the egress proxy dropped: a quarter of the sources fetched each hour failed while the others
+// kept bringing articles, so the stall alert stayed quiet and nobody heard. A handful failing is theirs to follow up.
+test("many sources failing within the hour is announced while the rest still collect", async () => {
+  process.env.COLLECT_ENABLED = "true";
+  const now = Date.now();
+  const ids = Array.from({ length: 300 }, (_, i) => `${SOURCE}-fetch-${i}`);
+  const run = (some: string[], status: "ok" | "failed", minutesAgo: number) => sql`
+    INSERT INTO fetch_runs (source_id, started_at, finished_at, status, error)
+    SELECT id, ${new Date(now - minutesAgo * 60_000)}, ${new Date(now - minutesAgo * 60_000)}, ${status},
+      ${status === "failed" ? "Client network socket disconnected before secure TLS connection was established" : null}
+    FROM unnest(${some}::text[]) id`;
+  const fetching = async (at = now, open?: Parameters<typeof collectFindings>[1]) =>
+    (await collectFindings(at, open)).find((f) => f.key === "content.fetch");
+  try {
+    await sql`INSERT INTO sources (id, name, kind, next_fetch_at) SELECT id, id, 'rss', '2100-01-01' FROM unnest(${ids}::text[]) id`;
+    await run(ids, "ok", 90);
+    await run(ids.slice(60), "ok", 20);
+    await run(ids.slice(0, 49), "failed", 20);
+    assert.equal(await fetching(), undefined, "49 failing sources are each one's own follow-up");
+    await run(ids.slice(49, 60), "failed", 15);
+    const finding = await fetching();
+    assert.equal(finding?.level, "now");
+    assert.match(finding!.impact!, /300 个信源.*60 个/);
+    assert.equal(finding!.since!.getTime(), now - 20 * 60_000, "dated by the first failure still standing");
+    // A failing source is not fetched again for hours (its backoff), while the others keep being fetched: neither
+    // time passing nor more successes elsewhere is recovery. Nor is pausing collection.
+    const open = { "content.fetch": { title: finding!.title, since: finding!.since!.toISOString() } };
+    const later = now + 2 * 3600_000;
+    await run(ids.slice(60), "ok", -100);
+    assert.equal((await fetching(later))?.key, "content.fetch", "still failing two hours on, with nothing refetched");
+    process.env.COLLECT_ENABLED = "false";
+    const resumed = now + 9 * 3600_000;
+    assert.equal((await fetching(resumed, open))?.key, "content.fetch", "paused nine hours: nothing proven");
+    process.env.COLLECT_ENABLED = "true";
+    await run(ids.slice(60), "ok", -535);
+    assert.equal((await fetching(resumed))?.key, "content.fetch", "resumed: the others fetched first prove nothing about these");
+    await run(ids.slice(0, 60), "ok", -538);
+    assert.equal(await fetching(resumed), undefined, "a source whose next fetch worked no longer counts");
+  } finally {
+    await sql`DELETE FROM sources WHERE id IN ${sql(ids)}`;
+    process.env.COLLECT_ENABLED = "false";
+  }
+});
+
 // A restart, a paused valve, or old failures leaving the initial detection window cannot
 // close an open incident. A partial repair must keep the remaining work visible.
 test("content incidents survive restarts, pauses, aging failures and partial recovery", async () => {
@@ -103,7 +147,7 @@ test("content incidents survive restarts, pauses, aging failures and partial rec
   }
 });
 
-// F20: alerts about a paid service name the steps currently routed to it: the admin choice, else a valid
+// Alerts about a paid service name the steps currently routed to it: the admin choice, else a valid
 // environment choice, else the site default. Failed calls a step made before it moved do not list it;
 // module steps count alike, and a step with nothing to do (an empty word list) is left out.
 test("refusal and spent-budget alerts name the steps currently routed to the provider", async () => {
@@ -181,6 +225,30 @@ test("backup failures still escalate after fifty hours without a success", async
     assert.equal((await backup())[0]?.level, "later", "a first failed attempt does not claim two days of failure");
   } finally {
     for (const key of Object.keys(process.env)) if (key.startsWith("DB_BACKUP_STORE_")) delete process.env[key];
+  }
+});
+
+// Baidu push failures: an hour of "please retry later" is not news; a day of them, or a revoked token that
+// never heals, is a follow-up until one run succeeds again.
+test("a Baidu push failing for a day is a follow-up; one success clears it", async () => {
+  const now = Date.now();
+  const hours = (h: number) => new Date(now - h * 3600_000);
+  const finding = async () => (await collectFindings(now)).find((f) => f.key === "seo.baidu-push");
+  try {
+    await sql`INSERT INTO job_runs (job, started_at, finished_at, status) VALUES ('seo.baidu-push', ${hours(30)}, ${hours(30)}, 'ok')`;
+    await sql`INSERT INTO job_runs (job, started_at, finished_at, status, error)
+      VALUES ('seo.baidu-push', ${hours(20)}, ${hours(20)}, 'failed', 'Error: Baidu push failed: 401 token is not valid')`;
+    assert.equal(await finding(), undefined, "failing for less than a day can be Baidu having a bad hour");
+    await sql`UPDATE job_runs SET started_at = ${hours(26)}, finished_at = ${hours(26)} WHERE job = 'seo.baidu-push' AND status = 'failed'`;
+    await sql`INSERT INTO job_runs (job, started_at, finished_at, status, error)
+      VALUES ('seo.baidu-push', ${hours(1)}, ${hours(1)}, 'failed', 'Error: Baidu push failed: 401 token is not valid')`;
+    const open = await finding();
+    assert.equal(open?.level, "later");
+    assert.match(open?.detail ?? "", /401 token is not valid/);
+    await sql`INSERT INTO job_runs (job, started_at, finished_at, status) VALUES ('seo.baidu-push', ${hours(0.5)}, ${hours(0.5)}, 'ok')`;
+    assert.equal(await finding(), undefined);
+  } finally {
+    await sql`DELETE FROM job_runs WHERE job = 'seo.baidu-push'`;
   }
 });
 
@@ -296,6 +364,7 @@ test("provider alerts use the same 429 spending classification as paid requests"
       }));
       const finding = (await collectFindings()).find(f => f.key === `provider.refused.${service}`);
       assert.equal(!!finding, expected, `${service}: ${JSON.stringify(body)}`);
+      if (finding) assert.equal(finding.owner, true, "only the owner can pay or fix the account");
     } finally {
       await sql`DELETE FROM receipts WHERE purpose=${purpose}`;
     }
@@ -344,7 +413,10 @@ test("a deliberately dropped delivery closes without claiming successful deliver
 test("provider recovery follows the refused model and current routing", async () => {
   const now = Date.now();
   const before = process.env.PREFILTER_MODEL;
+  const beforeFeedback = process.env.FEEDBACK_MODEL;
   process.env.PREFILTER_MODEL = "qwen3.7-flash";
+  // The other step on this model stays away, so the prefilter's switch below leaves it unused.
+  process.env.FEEDBACK_MODEL = "qwen3.8-flash";
   const [r] = await sql<{ id: number }[]>`INSERT INTO receipts(logical_key,service,model,purpose,status)
     VALUES('refusal-model-scope','dashscope','qwen3.7-flash','prefilter_article','failed') RETURNING id`;
   try {
@@ -369,6 +441,7 @@ test("provider recovery follows the refused model and current routing", async ()
     assert.ok((await checkAlerts(now+2*3600_000+120_000)).sent.includes('provider.refused.dashscope:qwen3.7-flash:recovered'));
   } finally {
     if (before===undefined) delete process.env.PREFILTER_MODEL; else process.env.PREFILTER_MODEL=before;
+    if (beforeFeedback===undefined) delete process.env.FEEDBACK_MODEL; else process.env.FEEDBACK_MODEL=beforeFeedback;
     invalidateModelCache();
     await sql`DELETE FROM receipts WHERE id=${r!.id}`;
   }
@@ -397,8 +470,10 @@ test("provider impact includes the same evaluated fallback as modelRoute", async
 
 test("a refusal first seen after switching models survives the first-hour window", async () => {
   const before = process.env.PREFILTER_MODEL;
+  const beforeFeedback = process.env.FEEDBACK_MODEL;
   const now = Date.now();
   process.env.PREFILTER_MODEL = "qwen3.8-flash";
+  process.env.FEEDBACK_MODEL = "qwen3.8-flash";
   invalidateModelCache();
   const key = "provider.refused.dashscope:qwen3.7-flash";
   const [r] = await sql<{ id: number }[]>`INSERT INTO receipts(logical_key,service,model,purpose,status)
@@ -416,6 +491,7 @@ test("a refusal first seen after switching models survives the first-hour window
     assert.ok(!recovered.sent.includes(`${key}:recovered`), "an incident never announced separately has no unsolicited recovery notice");
   } finally {
     if (before===undefined) delete process.env.PREFILTER_MODEL; else process.env.PREFILTER_MODEL=before;
+    if (beforeFeedback===undefined) delete process.env.FEEDBACK_MODEL; else process.env.FEEDBACK_MODEL=beforeFeedback;
     invalidateModelCache();
     await sql`DELETE FROM receipts WHERE id=${r!.id}`;
   }

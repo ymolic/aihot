@@ -1,5 +1,6 @@
 // First-party site API (/api/site/*). Not a public API: it may evolve with the website,
 // but it is served from the same public read layer as v1, RSS and MCP.
+import type { MentionTarget } from "./mentions.ts";
 import type { CategoryKey, ChannelKey } from "./taxonomy.ts";
 import { isoWeekRange, monthDay } from "./time.ts";
 
@@ -20,6 +21,26 @@ export interface MediaView {
   srcSet?: string;
 }
 
+/** The image proxy's AVIF variant of a rendition: its mode with this suffix, under the rendition's own signature. */
+export const AVIF_MODE_SUFFIX = "-avif";
+
+/** A proxied srcset's candidates as their AVIF variants, for a <picture> source ahead of the img's own. */
+export function avifCandidates(srcSet: string): string {
+  return srcSet.replace(/([?&]mode=[a-z0-9-]+)(?=&)/g, `$1${AVIF_MODE_SUFFIX}`);
+}
+
+/**
+ * The post an item quotes, as its page shows it: its words and their translation as HTML from the same
+ * renderer as the post's own text and the full RSS (paragraphs, lists, addresses as short links).
+ */
+export interface QuotedPostView {
+  authorName: string;
+  handle: string;
+  url: string;
+  html: string;
+  translationHtml: string | null;
+}
+
 export interface XPostView {
   authorName: string;
   handle: string;
@@ -30,6 +51,8 @@ export interface XPostView {
   /** translation: Chinese translation of the quoted post, when it is in another language. */
   quoted: { authorName: string; handle: string; text: string; url: string; translation: string | null } | null;
   media: MediaView[];
+  /** The post publishes a long X Article: its page reads like an article, under a headline. */
+  article: boolean;
 }
 
 export interface StoryRef {
@@ -59,7 +82,7 @@ export interface ItemSummary {
 
 /** The fields rendered by a site feed card; full original text lives in the item detail. */
 export interface FeedItemSummary extends Pick<ItemSummary, "id" | "title" | "summary" | "reason" | "source" | "publishedAt" | "timelineAt" | "category" | "tags" | "score" | "selected" | "channel"> {
-  x: (Pick<XPostView, "authorName" | "handle" | "avatarUrl" | "avatarSrcSet" | "media"> & {
+  x: (Pick<XPostView, "authorName" | "handle" | "avatarUrl" | "avatarSrcSet" | "media" | "article"> & {
     quoted: Omit<NonNullable<XPostView["quoted"]>, "url"> | null;
   }) | null;
   /**
@@ -135,8 +158,8 @@ export interface OutlineEntry {
  * unless …/original asks for the original. Only the body shown is sent, with its outline.
  */
 export interface SiteItemDetail extends ItemSummary {
-  /** The post with all its media; its text is the body. */
-  x: Omit<XPostView, "text" | "translation"> | null;
+  /** The post with all its media; its text is the body, and the post it quotes is set as that body is. */
+  x: (Omit<XPostView, "text" | "translation" | "quoted"> & { quoted: QuotedPostView | null }) | null;
   /** Selected, but its fact's seat is held by this report: marked 同事件, without a reason of its own. */
   sameEvent?: { id: string; title: string } | null;
   readingMode: "full" | "summary-only";
@@ -148,10 +171,14 @@ export interface SiteItemDetail extends ItemSummary {
   /** The topics the report belongs to. */
   topics: TopicLink[];
   indexable: boolean;
+  /** Indexable, but its own text says no more than its summary: only Google is asked not to index it. */
+  googleNoindex: boolean;
   markdownAvailable: boolean;
   group: GroupInfo | null;
   hasTranslation: boolean;
   bodyLanguage: "zh" | "original";
+  /** The pages its summary names (mentions.ts). */
+  mentions: MentionTarget[];
 }
 
 /** A fact's public reports under the list's filters: what "另外 N 家也报道了" opens. */
@@ -263,6 +290,8 @@ export interface StoryDetail {
   related: Array<StoryRef & { relation: "storyline" | "related" }>;
   /** The topics its reports belong to, most reports first. */
   topics: TopicLink[];
+  /** The pages its overview names (mentions.ts). */
+  mentions: MentionTarget[];
 }
 
 // Reports (daily / weekly / monthly)
@@ -295,6 +324,8 @@ export interface ReportCitation {
   available: boolean;
   /** A daily entry: other sources that reported the event by the issue's cutoff. */
   otherSources?: number;
+  /** That event's page (publicId). */
+  storyId?: string;
   /** A daily entry's other developments of the event, or reports of the launch merged into it (titles only). */
   related?: ReportCitation[];
   /** A daily entry whose event an earlier daily covered: that issue's date. */
@@ -325,6 +356,8 @@ export interface ReportDetail {
   readingMinutes: number;
   prev: string | null;
   next: string | null;
+  /** The pages its paragraphs and summaries name (mentions.ts). */
+  mentions: MentionTarget[];
 }
 
 export interface ReportIndexEntry {
@@ -441,6 +474,8 @@ export interface Brand {
   monogram: string;
   /** Raster marks get a light backing plate in dark mode. */
   raster: boolean;
+  /** An app icon: its own tile, drawn edge to edge. */
+  fill?: boolean;
 }
 
 export interface TopicSummary extends TopicLink {

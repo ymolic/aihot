@@ -116,7 +116,11 @@ test("a page failing after the first keeps what was read and goes on from there 
   assert.equal((await cursorOf(IDS[0]!)).lastTweetId, String(BASE + 104n), "the watermark moves to the account's newest post read");
   const cursor = (await sql<{ cursor: { lastTweetId: string; xBacklog?: unknown[] } }[]>`SELECT cursor FROM sources WHERE id = ${IDS[2]!}`)[0]!.cursor;
   assert.equal(cursor.lastTweetId, String(WATERMARK - 1n), "a quiet account keeps its own");
-  assert.equal(cursor.xBacklog?.length, 1, "the rest is kept to read");
+  assert.equal(cursor.xBacklog, undefined, "the stretch is not copied onto every account");
+  const holders = await sql<{ id: string; cursor: { xBacklog?: unknown[] } }[]>`
+    SELECT id, cursor FROM sources WHERE id IN ${sql(IDS)} AND cursor ? 'xBacklog'`;
+  assert.deepEqual(holders.map((h) => h.id), [IDS[0]], "one account of the shard keeps the rest to read");
+  assert.equal(holders[0]!.cursor.xBacklog?.length, 1);
   const partial = await sql`SELECT status FROM receipts WHERE subject = ${`x-shard:editorial:test-${T}`}
     AND request->>'query' LIKE ${`%since_id:${WATERMARK - 1n}`} ORDER BY id`;
   assert.deepEqual(partial.map((r) => r.status), ["completed", "failed"], "only received pages complete; a failed page remains retryable");
@@ -124,6 +128,18 @@ test("a page failing after the first keeps what was read and goes on from there 
   assert.equal(second.found, 2, "the next run reads the rest");
   const stored = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM articles WHERE source_id IN ${sql(IDS)}`;
   assert.equal(stored[0]!.n, 4, "no post between the old watermark and the newest is lost");
+});
+
+test("posts of an account regrouped elsewhere since a stretch was left over still reach it", async () => {
+  await sql`DELETE FROM articles WHERE source_id IN ${sql(IDS)}`;
+  const stretch = { query: `${shardQuery([HANDLES[0]!, HANDLES[1]!])} since_id:${WATERMARK - 2n}`, next: "0", at: new Date().toISOString() };
+  await sql`UPDATE sources SET cursor = (cursor - 'lastOkAt') || ${sql.json({ lastTweetId: String(BASE + 104n), xBacklog: [stretch] })} WHERE id = ${IDS[0]!}`;
+  await sql`UPDATE sources SET cursor = (cursor - 'lastOkAt' - 'xBacklog') || ${sql.json({ lastTweetId: String(BASE + 104n) })} WHERE id = ${IDS[1]!}`;
+  assert.equal((await collectXShard(`editorial:regrouped-${T}`, [IDS[0]!])).status, "ok");
+  const [moved] = await sql<{ n: number }[]>`SELECT count(*)::int AS n FROM articles WHERE source_id = ${IDS[1]!}`;
+  assert.equal(moved!.n, 1, "the post goes to its account, which holds no copy of the stretch");
+  await sql`UPDATE sources SET cursor = (cursor - 'xBacklog') || ${sql.json({ lastTweetId: String(WATERMARK) })} WHERE id IN ${sql(IDS)}`;
+  await sql`DELETE FROM articles WHERE source_id IN ${sql(IDS)}`;
 });
 
 test("a quiet account's old newest post does not drag the shard's search back: its last check does", async () => {

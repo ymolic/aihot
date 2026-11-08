@@ -1,4 +1,5 @@
 import { redirect, useLoaderData } from "react-router";
+import { SITE } from "@aihot/site";
 import type { Route } from "./+types/home";
 import type { TimelineResponse } from "@aihot/contracts/site";
 import { cachedPage, loadOr404 } from "../lib/api.server";
@@ -22,13 +23,17 @@ export async function loader({ request }: Route.LoaderArgs) {
   const filters = readFilters(url.searchParams);
   const upstream = new Headers();
   const data = await loadOr404<TimelineResponse>(listPath("/api/site/timeline", filterParams(filters)), { responseHeaders: upstream, signal: request.signal });
+  // A minute at most, here and on /all: new selections must not wait longer at the edge or in a browser.
   return cachedPage(60, { data, filters }, upstream);
 }
 
 export function meta({ loaderData }: Route.MetaArgs) {
   const path = listPath("/", loaderData ? filterParams(loaderData.filters) : {});
   const titles = loaderData?.data.cards.map((c) => c.item.title) ?? [];
-  return pageMeta({ path, noindex: hasFeedFilters(loaderData?.filters), jsonLd: path === "/" ? [...siteLd(), itemListLd("/", "精选", titles)] : undefined });
+  const tags = pageMeta({ path, noindex: hasFeedFilters(loaderData?.filters), jsonLd: path === "/" ? [...siteLd(), itemListLd("/", "精选", titles)] : undefined });
+  // Webmaster platforms look for their verification tag on the home page only.
+  if (path !== "/") return tags;
+  return [...tags, ...Object.entries(SITE.siteVerification).map(([name, content]) => ({ name, content }))];
 }
 
 export default function Home() {
