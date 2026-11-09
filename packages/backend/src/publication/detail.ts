@@ -2,16 +2,18 @@
 import type { OutlineEntry, SiteItemDetail, StoryRef } from "@aihot/contracts/site";
 import { ITEM_COPY, SITE } from "@aihot/site";
 import { bodyToMarkdown } from "../content/markdown.ts";
+import { withCover, type Cover } from "../content/cover.ts";
 import { sql } from "../db.ts";
 import { isChineseText, stripTagMarkup } from "../lib/text.ts";
 import { proxyBodyImages } from "../media/imgproxy.ts";
 import { textToHtml } from "../content/sanitize.ts";
 import { xArticleBody } from "../content/posts.ts";
-import { exportTranslation, isChineseBody, ITEM_COLUMNS, ITEM_FROM, seatHolders, showsPost, thinPageCondition, toItemSummary, xView, type ItemRow } from "./items.ts";
+import { eventPageCondition, exportTranslation, isChineseBody, ITEM_COLUMNS, ITEM_FROM, seatHolders, showsPost, thinPageCondition, toItemSummary, xView, type ItemRow } from "./items.ts";
 import { evidenceCondition, listedCondition } from "./scope.ts";
 import { itemUrl, siteUrl } from "./links.ts";
 import { hasItemPage, publicSourceName } from "./rules.ts";
-import { topicLinks, topicMembership } from "./topics.ts";
+import { tagTopics, topicLinks, topicMembership } from "./topics.ts";
+import { firstDaily } from "./reports.ts";
 import { mentionsIn } from "./mentions.ts";
 
 interface DetailRow extends ItemRow {
@@ -20,10 +22,13 @@ interface DetailRow extends ItemRow {
   body_html: string | null;
   body_text: string | null;
   body_status: string;
+  cover: Cover | null;
   tr_html: string | null;
   tr_complete: boolean | null;
   topics: string[];
   thin: boolean;
+  /** Its event page stands for it in search (eventPageCondition). */
+  event_page: boolean;
 }
 
 export type DetailResult =
@@ -44,11 +49,11 @@ function withOutline(html: string): { html: string; outline: OutlineEntry[] } {
   return { html: out, outline };
 }
 
-async function loadRow(id: string): Promise<DetailRow | null> {
+async function loadRow(id: string, now = new Date()): Promise<DetailRow | null> {
   const [row] = await sql<DetailRow[]>`
     SELECT ${ITEM_COLUMNS}, CASE WHEN p.body_mode = 'full' THEN a.x_article->>'html' END AS x_article_html,
-      a.body_html, a.body_text, a.body_status, tr.body_html AS tr_html, tr.complete AS tr_complete,
-      ${topicMembership()} AS topics, ${thinPageCondition()} AS thin
+      a.body_html, a.body_text, a.body_status, a.cover, tr.body_html AS tr_html, tr.complete AS tr_complete,
+      ${topicMembership()} AS topics, ${thinPageCondition()} AS thin, ${eventPageCondition(now)} AS event_page
     ${ITEM_FROM}
     WHERE p.article_id = ${id}`;
   return row ?? null;
@@ -83,7 +88,7 @@ function readingBody(
  * withdrawn and hot_signal items are a 404.
  */
 export async function loadItemDetail(id: string, language: "zh" | "original" = "zh", now = new Date()): Promise<DetailResult> {
-  const row = await loadRow(id);
+  const row = await loadRow(id, now);
   if (!row || !hasItemPage({ visibility: row.visibility, sourceMode: row.source_mode })) return { kind: "not_found" };
 
   const summary = toItemSummary(row);
@@ -103,6 +108,8 @@ export async function loadItemDetail(id: string, language: "zh" | "original" = "
       outline: [],
       relatedStories: [],
       topics: [],
+      tagTopics: {},
+      daily: null,
       indexable: false,
       googleNoindex: false,
       markdownAvailable: false,
@@ -155,7 +162,8 @@ export async function loadItemDetail(id: string, language: "zh" | "original" = "
   } else if (row.body_mode === "full" && row.body_html) {
     const chinese = isChineseBody(row);
     const zh = chinese ? { html: row.body_html, kind: "original" as const } : row.tr_html ? { html: row.tr_html, kind: "translation" as const } : null;
-    reading = readingBody(language, zh, chinese ? null : row.body_html, chinese ? true : row.tr_complete ?? false, (html) => withOutline(proxyBodyImages(html)));
+    reading = readingBody(language, zh, chinese ? null : row.body_html, chinese ? true : row.tr_complete ?? false,
+      (html) => withOutline(proxyBodyImages(withCover(html, row.cover, row.body_html))));
   }
 
   let group: SiteItemDetail["group"] = null;
@@ -186,8 +194,10 @@ export async function loadItemDetail(id: string, language: "zh" | "original" = "
     outline: reading.outline,
     relatedStories: related,
     topics: topicLinks(row.topics),
+    tagTopics: tagTopics(summary.tags),
+    daily: await firstDaily(id),
     indexable: row.indexable,
-    googleNoindex: row.indexable && row.thin,
+    googleNoindex: row.indexable && (row.thin || row.event_page),
     markdownAvailable: markdownAvailable(row),
     group,
     hasTranslation: reading.hasTranslation,
@@ -240,8 +250,8 @@ export async function exportMarkdown(id: string): Promise<{ filename: string; bo
     if (q?.text && q.translation) lines.push("### 引用中文译文", "", ...q.translation.split("\n").map((l) => `> ${l}`), "");
   } else if (row.body_mode === "full" && row.body_html) {
     const translation = exportTranslation(row);
-    if (translation) lines.push("## 正文 · 中文译文", "", bodyToMarkdown(translation, row.url), "");
-    lines.push(isChineseBody(row) ? "## 正文" : "## 正文 · 原文", "", bodyToMarkdown(row.body_html, row.url), "");
+    if (translation) lines.push("## 正文 · 中文译文", "", bodyToMarkdown(withCover(translation, row.cover, row.body_html), row.url), "");
+    lines.push(isChineseBody(row) ? "## 正文" : "## 正文 · 原文", "", bodyToMarkdown(withCover(row.body_html, row.cover, row.body_html), row.url), "");
   }
   return { filename: `${SITE.mcpPrefix}-${row.id}.md`, body: lines.join("\n").replace(/\n{3,}/g, "\n\n") };
 }

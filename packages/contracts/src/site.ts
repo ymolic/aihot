@@ -170,6 +170,10 @@ export interface SiteItemDetail extends ItemSummary {
   relatedStories: StoryRef[];
   /** The topics the report belongs to. */
   topics: TopicLink[];
+  /** Of its tags, each that is a topic's own (a direction's or a form's, or the tag shown for a company), with that topic's slug. */
+  tagTopics: Record<string, string>;
+  /** The first daily that carries it, while that issue lists it: the issue's key, and whether the issue leads with it. */
+  daily: { key: string; lead: boolean } | null;
   indexable: boolean;
   /** Indexable, but its own text says no more than its summary: only Google is asked not to index it. */
   googleNoindex: boolean;
@@ -259,6 +263,13 @@ export interface StoryFactView {
   representative: StoryReportView;
 }
 
+/**
+ * An event page stands for its reports in search once it gathers this many public reports (reportCount):
+ * with fewer it only repeats its one report's page, so it is noindex and neither the sitemap nor change
+ * notifications list it; with as many, its reports' own pages leave Google to it (2026-11-09).
+ */
+export const STORY_INDEX_MIN_REPORTS = 2;
+
 export interface StoryDetail {
   publicId: string;
   title: string;
@@ -326,7 +337,7 @@ export interface ReportCitation {
   otherSources?: number;
   /** That event's page (publicId). */
   storyId?: string;
-  /** A daily entry's other developments of the event, or reports of the launch merged into it (titles only). */
+  /** A daily entry's other developments of the event, or reports of the launch merged into it: the first few it lists (titles only). */
   related?: ReportCitation[];
   /** A daily entry whose event an earlier daily covered: that issue's date. */
   followUp?: string;
