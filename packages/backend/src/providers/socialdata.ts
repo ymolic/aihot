@@ -116,7 +116,8 @@ export function tweetText(t: SdTweet): string {
   let text = decodeTweetEntities(t.full_text ?? t.text ?? "");
   // Expand t.co links and drop trailing media links.
   for (const u of t.entities?.urls ?? []) text = text.replaceAll(u.url, u.expanded_url);
-  for (const m of t.extended_entities?.media ?? t.entities?.media ?? []) text = text.replace(/\s*https:\/\/t\.co\/\w+\s*$/, "");
+  const mediaCount = (t.extended_entities?.media ?? t.entities?.media)?.length ?? 0;
+  for (let i = 0; i < mediaCount; i++) text = text.replace(/\s*https:\/\/t\.co\/\w+\s*$/, "");
   return text.trim();
 }
 
@@ -130,8 +131,8 @@ export function tweetMedia(t: SdTweet) {
   }));
 }
 
-/** A picture in an X Article; a video or GIF has only its still here. */
-interface SdArticleImage {
+/** A picture or a video's preview in an X Article. */
+export interface SdArticleImage {
   original_img_url?: string;
   original_img_width?: number;
   original_img_height?: number;
@@ -145,7 +146,11 @@ interface SdArticleImage {
 export interface SdArticle {
   title?: string;
   cover_url?: string;
-  media_entities?: Array<{ media_id?: string; media_info?: SdArticleImage & { __typename?: string; preview_image?: SdArticleImage } }>;
+  media_entities?: Array<{ media_id?: string; media_info?: SdArticleImage & {
+    __typename?: string;
+    preview_image?: SdArticleImage;
+    variants?: Array<{ url?: string; content_type?: string; bit_rate?: number }>;
+  } }>;
   content_state?: {
     blocks?: Array<{
       type?: string;

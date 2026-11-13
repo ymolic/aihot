@@ -42,6 +42,7 @@ const provider = await stub(async (_hit, req) => {
       return n === 1 ? "解释 Neuroglancer 的文字 ⟦0⟧。" : '解释 <a id="L0">Neuroglancer</a> 的文字 ⟦0⟧。';
     }
     if (s.includes("never keeps")) return "丢了链接。";
+    if (s.includes("Cited paragraph")) return '引用<a id="L0">来源</a>的段落。';
     if (s.includes("Introducing")) return "隆重推出 Sonnet 5.5。";
     return s.includes("twenty") ? "价格是二十美元。" : s.includes("ten") ? "价格是十美元。" : "译文";
   });
@@ -237,6 +238,21 @@ test("links and images inside a paragraph survive the translation, or the paragr
   const receipts = await sql<{ status: string }[]>`SELECT status FROM receipts WHERE purpose = 'translate_body' AND subject LIKE ${`article:${id}@1#%`}`;
   assert.ok(receipts.length >= 2, "the initial batch and fallback/retry batches are retained");
   assert.ok(receipts.every((receipt) => receipt.status === "completed"), "every paid batch covered by the committed translation is completed");
+});
+
+test("the length cap counts what the model is sent, not the addresses of links it never sees", async () => {
+  // About 69,000 characters of paragraph markup, under 6,000 once each link is reduced to its id.
+  const href = `https://example.com/${"x".repeat(1600)}`;
+  const html = Array.from({ length: 40 }, (_v, i) => `<p>Cited paragraph ${i} with <a href="${href}">its source</a> (${T}).</p>`).join("");
+  const { articleId } = await upsertMaterial({ sourceId: SOURCE, url: `${URL_}-long-links`, title: `Long links ${T}`, language: "en",
+    bodyText: html.replace(/<[^>]+>/g, ""), bodyHtml: html, bodyStatus: "ok", via: "fetch", publishedAt: new Date() });
+  await sql`INSERT INTO analyses (article_id,input_revision,origin,relevance,category,title_zh,summary_zh,reason_zh,score,selected)
+    VALUES (${articleId},1,'rule','pass','ai-models','长链接','摘要','理由',90,true)`;
+  await publishArticle(articleId, { releasedAt: new Date(Date.now() - 60_000) });
+  assert.equal((await translateArticle(articleId)).status, "translated");
+  const body = (await detail(articleId)).body;
+  assert.equal(body.complete, true);
+  assert.equal(body.zh?.match(/引用<a href="https:\/\/example\.com\/x+">来源<\/a>的段落/g)?.length, 40);
 });
 
 test("the post a selected X post quotes is translated once and shown with the item", async () => {
@@ -510,4 +526,39 @@ test("external model translation import restores against the exact body and reje
     bodyHtml:'<p>The price is twenty dollars.</p>',bodyText:'The price is twenty dollars.',bodyStatus:'ok',via:'import'});
   await assert.rejects(importBodyTranslation(input),/source changed/);
   assert.equal((await sql`SELECT revision FROM translations WHERE article_id=${articleId}`)[0].revision,saved.revision);
+});
+
+test("a failed old translation does not consume or overwrite the corrected revision's attempts", async () => {
+  for (const newerAttempt of [false, true]) {
+    const input = {sourceId:SOURCE,url:`${URL_}-late-failure-${newerAttempt}`,title:`Corrected translation ${T}`,
+      language:"en",bodyText:`The price is ten dollars ${T}.`,bodyHtml:`<p>The price is ten dollars ${T}.</p>`,
+      bodyStatus:"ok" as const,via:"fetch" as const,publishedAt:new Date(),discoveredAt:new Date(Date.now()+40_000_000)};
+    const {articleId:id}=await upsertMaterial(input);
+    await sql`INSERT INTO analyses(article_id,input_revision,origin,relevance,category,title_zh,summary_zh,reason_zh,score,selected)
+      VALUES(${id},1,'rule','pass','ai-models','价格更正','摘要','理由',90,true)`;
+    await publishArticle(id,{releasedAt:new Date(Date.now()-60_000)});
+    const entered=gate(),release=gate();
+    const rejected=await stub(async()=>{entered.open();await release.promise;return new Reply(400,{error:"invalid old request"});});
+    process.env.DEEPSEEK_BASE_URL=`${rejected.url}/v1`;
+    try {
+      const run=translatePending({limit:1});
+      await entered.promise;
+      await upsertMaterial({...input,bodyText:`The price is twenty dollars ${T}.`,bodyHtml:`<p>The price is twenty dollars ${T}.</p>`});
+      if(newerAttempt) await sql`INSERT INTO translation_attempts(article_id,revision,attempts,outcome,reason)
+        VALUES(${id},2,2,'failed','new revision attempt')`;
+      release.open();
+      await run;
+      const [attempt]=await sql`SELECT revision,attempts,reason FROM translation_attempts WHERE article_id=${id}`;
+      assert.equal(attempt!.revision,newerAttempt?2:1,"failure belongs to the body sent to the model");
+      assert.equal(attempt!.attempts,newerAttempt?2:1,"an old completion cannot spend the new revision's attempts");
+      if(newerAttempt) assert.equal(attempt!.reason,'new revision attempt');
+    } finally {
+      release.open();process.env.DEEPSEEK_BASE_URL=`${provider.url}/v1`;await rejected.close();
+    }
+    await sql`INSERT INTO analyses(article_id,input_revision,origin,relevance,category,title_zh,summary_zh,reason_zh,score,selected)
+      VALUES(${id},2,'rule','pass','ai-models','价格已更正','摘要','理由',90,true)`;
+    await publishArticle(id,{releasedAt:new Date(Date.now()-60_000)});
+    assert.equal((await translatePending({limit:1})).done.find(r=>r.articleId===id)?.status,'translated');
+    assert.match((await detail(id)).body.zh??'',/二十美元/);
+  }
 });

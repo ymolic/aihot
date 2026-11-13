@@ -2,6 +2,7 @@
 // Jina Reader is the budgeted fallback for pages that only render in a browser.
 import { Readability } from "@mozilla/readability";
 import { parseHTML } from "linkedom";
+import { DEPLOYMENT } from "@aihot/site";
 import { sql } from "../db.ts";
 import { guardedFetch, languageHeaders } from "../lib/http-fetch.ts";
 import { assertPageContent, contentDocument, UnavailablePageError } from "../lib/page-content.ts";
@@ -822,7 +823,8 @@ export async function extractFromUrl(url: string, subject: string, rules: PageRu
   if (opts.paidFallback === false) return null;
   try {
     // The rendered text carries none of the page's metadata, so a body read this way has no cover.
-    const page = await jinaRead(target.href, { purpose: "body_fallback", subject, removeSelector: PAGE_CHROME });
+    const extra = (DEPLOYMENT as { renderedArticleRemoveSelectors?: Record<string, string> }).renderedArticleRemoveSelectors?.[target.hostname];
+    const page = await jinaRead(target.href, { purpose: "body_fallback", subject, removeSelector: extra ? `${PAGE_CHROME},${extra}` : PAGE_CHROME });
     const html = markdownBody(page.markdown, url);
     const text = stripTags(html);
     if (text.length < MIN_BODY_CHARS) return null;
@@ -898,7 +900,7 @@ async function extractXArticle(articleId: string, tweetId: string, revision: num
     return markUnconfirmed(articleId, revision);
   }
   return sql.begin(async (tx) => {
-    const [row] = await tx<{ title: string; excerpt: string | null; body_text: string | null; x_post: { text?: string } | null; x_article: { title?: string | null; text?: string } | null }[]>`
+    const [row] = await tx<{ title: string; excerpt: string | null; body_text: string | null; x_post: { text?: string } | null; x_article: { title?: string | null; text?: string; html?: string | null } | null }[]>`
       SELECT title, excerpt, body_text, x_post, x_article FROM articles
       WHERE id = ${articleId} AND revision = ${revision} AND body_status <> 'ok' FOR UPDATE`;
     if (!row) return "skipped";
@@ -911,7 +913,10 @@ async function extractXArticle(articleId: string, tweetId: string, revision: num
     const title = got.title && onlyXArticleLink(row.x_post?.text) ? got.title : row.title;
     const bodyText = [base, block(got)].filter(Boolean).join("\n\n");
     if (bodyText === row.body_text && title === row.title) {
-      // The same article again: nothing new, no new revision.
+      // The same words can have new media. Update their presentation without a new semantic revision.
+      if (row.x_article?.html && got.html) {
+        await updatePresentation(tx, articleId, { xArticleHtml: got.html });
+      }
       await tx`UPDATE articles SET body_status = 'ok', x_article = ${tx.json(got as never)}, updated_at = now() WHERE id = ${articleId}`;
       return "ok";
     }
