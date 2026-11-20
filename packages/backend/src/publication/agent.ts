@@ -270,7 +270,7 @@ function publicCategoryName(key: PublicApiCategoryKey): string {
 export function agentGuide(): string {
   const u = agentUrl;
   const abilities = serverModules().flatMap((m) => m.agent?.abilities ?? []);
-  const unavailable = serverModules().flatMap((m) => m.agent?.unavailable ?? []);
+  const pages = serverModules().flatMap((m) => m.agent?.pages ?? []);
   const requests = serverModules().flatMap((m) => m.agent?.requests ?? []);
   const categories = PUBLIC_API_CATEGORY_KEYS.map((key) => `${key}（${publicCategoryName(key)}）`);
   // Examples use one of the site's configured public categories.
@@ -297,13 +297,13 @@ export function agentGuide(): string {
     `| ${SITE.name} 日报 | ${u("/daily")}（最新一期）；指定日期：${u("/daily/2026-09-30")} |`,
     `| 这一周、这个月的重点（周报、月报） | ${u("/weekly")}、${u("/monthly")}（最新一期）；指定一期：${u("/weekly/2026-W39")}、${u("/monthly/2026-09")} |`,
     ...abilities.map((a) => `| ${a.ask} | ${u(a.path)} |`),
+    ...pages.map((p) => `| ${p.ask} | ${p.where} |`),
     "",
     `参数可以组合，例如 ${u(`/latest?window=7d&category=${sample}`)}；关键词要做 URL 编码。`,
     "",
     "## 目前查不到的",
     "",
     "- 超过 7 天的历史搜索。",
-    ...unavailable.map((line) => `- ${line}`),
     `- 单篇文章全文：给用户 ${SITE.name} 阅读页链接；数字、原话等重要内容请用户回原文核对。`,
     "",
     "## 怎么回答",

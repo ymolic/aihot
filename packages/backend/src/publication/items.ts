@@ -1,7 +1,7 @@
 // Public read layer, item level. Every exit (site API, v1, RSS, MCP, sitemap) reads
 // items through these columns and views; which rows are public is decided by scope.ts.
 import { CATEGORY_KEYS, toPublicApiCategory, type CategoryKey, type ChannelKey, type PublicApiCategoryKey } from "@aihot/contracts/taxonomy";
-import { STORY_INDEX_MIN_REPORTS, type FeedItemSummary, type ItemSummary, type MediaView, type XPostView } from "@aihot/contracts/site";
+import { STORY_INDEX_MIN_SOURCES, type FeedItemSummary, type ItemSummary, type MediaView, type XPostView } from "@aihot/contracts/site";
 import { POLICY } from "@aihot/site";
 import { sql, type Db } from "../db.ts";
 import { isChineseText } from "../lib/text.ts";
@@ -30,6 +30,7 @@ export interface ItemRow {
   seat: boolean;
   visibility: string;
   body_mode: "full" | "summary";
+  suppress_original?: boolean;
   indexable: boolean;
   fact_id: number | null;
   source_name: string;
@@ -53,11 +54,14 @@ export interface ItemRow {
 export const ITEM_COLUMNS = sql`
   p.article_id AS id, p.title, p.original_title, p.summary, p.reason, p.category, p.tags, p.score,
   p.selected, p.seat, p.channel, p.url, p.published_at, p.discovered_at, p.timeline_at, p.visibility,
-  p.body_mode, p.indexable, p.fact_id, s.name AS source_name, s.participation_mode AS source_mode,
-  a.x_post, CASE WHEN p.body_mode = 'full' THEN a.x_article - 'html' END AS x_article, a.author, a.language,
-  CASE WHEN s.kind = 'x_search' AND ${sourceOwnsPost(sql`s.config`, sql`a.x_post->>'handle'`)} THEN s.icon_url END AS author_avatar_url,
+  p.body_mode, p.suppress_original, p.indexable, p.fact_id, s.name AS source_name, s.participation_mode AS source_mode,
+  CASE WHEN NOT p.suppress_original THEN a.x_post END AS x_post,
+  CASE WHEN p.body_mode = 'full' AND NOT p.suppress_original THEN a.x_article - 'html' END AS x_article,
+  a.author, a.language,
+  CASE WHEN NOT p.suppress_original AND s.kind = 'x_search' AND ${sourceOwnsPost(sql`s.config`, sql`a.x_post->>'handle'`)} THEN s.icon_url END AS author_avatar_url,
   st.public_id::text AS story_public_id, st.title AS story_title,
-  CASE WHEN p.channel = 'x' THEN tr.body_text END AS zh_text, qt.text_zh AS quoted_zh`;
+  CASE WHEN p.channel = 'x' AND NOT p.suppress_original THEN tr.body_text END AS zh_text,
+  CASE WHEN NOT p.suppress_original THEN qt.text_zh END AS quoted_zh`;
 
 /** Public API listings never render article bodies, X media or story metadata. */
 export type ApiItemRow = Pick<ItemRow, "id" | "title" | "original_title" | "summary" | "source_name" | "url" | "published_at" | "discovered_at" | "category" | "score" | "selected" | "reason">;
@@ -149,8 +153,8 @@ export function xView(row: Pick<ItemRow, "x_post" | "zh_text"> & Partial<Pick<It
  * Whether pages show an X post's own text and media. A site that counts them as full text shows them
  * only where the source allows full text, as it does an article's body.
  */
-export function showsPost(row: { channel: string; body_mode: string }): boolean {
-  return row.channel === "x" && (!POLICY.xPostIsFullText || row.body_mode === "full");
+export function showsPost(row: { channel: string; body_mode: string; suppress_original?: boolean }): boolean {
+  return row.channel === "x" && !row.suppress_original && (!POLICY.xPostIsFullText || row.body_mode === "full");
 }
 
 /** A page's own text shorter than this is one standard post's worth (280 characters) or less. */
@@ -166,7 +170,9 @@ export const THIN_PAGE_CHARS = 300;
  * later does not flip the decision.
  */
 export function thinPageCondition() {
-  const post = POLICY.xPostIsFullText ? sql`p.channel = 'x' AND p.body_mode = 'full'` : sql`p.channel = 'x'`;
+  const post = POLICY.xPostIsFullText
+    ? sql`p.channel = 'x' AND NOT p.suppress_original AND p.body_mode = 'full'`
+    : sql`p.channel = 'x' AND NOT p.suppress_original`;
   return sql`(p.seo_indexed_at IS NULL AND CASE
     WHEN ${post} THEN char_length(CASE WHEN a.x_post IS NULL THEN coalesce(a.body_text, '') ELSE coalesce(a.x_post->>'text', '') END)
       + CASE WHEN p.body_mode = 'full' THEN char_length(coalesce(a.x_article->>'text', '')) ELSE 0 END
@@ -174,18 +180,23 @@ export function thinPageCondition() {
     ELSE 0 END < ${THIN_PAGE_CHARS})`;
 }
 
+/** The article's own event (`st`, over ITEM_FROM) is covered by STORY_INDEX_MIN_SOURCES distinct public sources or more. */
+export function storyIndexableCondition(now: Date) {
+  return sql`(st.id IS NOT NULL AND (
+    SELECT count(DISTINCT p.source_id) FROM facts f JOIN fact_articles fa ON fa.fact_id = f.id
+    JOIN publications p ON p.article_id = fa.article_id JOIN sources s ON s.id = p.source_id
+    WHERE f.story_id = st.id AND ${storyReportCondition(now)}) >= ${STORY_INDEX_MIN_SOURCES})`;
+}
+
 /**
- * The article's own event (`st`, over ITEM_FROM) gathers STORY_INDEX_MIN_REPORTS public reports or more, so the
- * event page stands for them in search. As with a thin page, Google is asked not to index the article
- * (googlebot noindex) and the sitemap leaves it out; every other engine indexes it as `indexable` says, and
- * change notifications keep it. A page an editor marked for indexing stays. The reports are counted as the
- * event page counts them; inside the count, `p` and `s` are the event's reports, not the article.
+ * The article's own event (`st`, over ITEM_FROM) is covered by STORY_INDEX_MIN_SOURCES distinct public sources
+ * or more, so the event page stands for them in search. As with a thin page, Google is asked not to index the
+ * article (googlebot noindex) and the sitemap leaves it out; every other engine indexes it as `indexable`
+ * says, and change notifications keep it. A page an editor marked for indexing stays. The sources are counted
+ * as the event page counts them; inside the count, `p` and `s` are the event's reports, not the article.
  */
 export function eventPageCondition(now: Date) {
-  return sql`(p.seo_indexed_at IS NULL AND st.id IS NOT NULL AND (
-    SELECT count(DISTINCT p.article_id) FROM facts f JOIN fact_articles fa ON fa.fact_id = f.id
-    JOIN publications p ON p.article_id = fa.article_id JOIN sources s ON s.id = p.source_id
-    WHERE f.story_id = st.id AND ${storyReportCondition(now)}) >= ${STORY_INDEX_MIN_REPORTS})`;
+  return sql`(p.seo_indexed_at IS NULL AND ${storyIndexableCondition(now)})`;
 }
 
 /** The shared public article; its X post is added as each answer shows it. */

@@ -22,7 +22,7 @@ type Entry = Awaited<ReturnType<typeof loadDiscoveryEntries>>[number];
 // page (a model, a board's prices) or topic answers searches for months and comes a few a week, so it goes
 // right after the report instead of waiting behind each day's news for good. Stories carry no date in the
 // full inventory, which lists them newest first; the sort is stable and keeps that order.
-const RANK: [RegExp, number][] = [[/^\/(daily|weekly|monthly)\//, 0], [/^\/leaderboard\//, 1], [/^\/topics\//, 2], [/^\/story\//, 3], [/^\/items\//, 4]];
+const RANK: [RegExp, number][] = [[/^\/(daily|weekly|monthly)\//, 0], [/^\/leaderboard\//, 1], [/^\/topics\/[^/]+$/, 2], [/^\/story\//, 3], [/^\/items\//, 4]];
 const rank = (loc: string) => RANK.find(([pattern]) => pattern.test(loc))?.[1] ?? 5;
 const time = (e: Entry) => e.newsAt?.getTime() ?? e.lastmod?.getTime() ?? 0;
 

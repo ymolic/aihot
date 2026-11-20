@@ -58,6 +58,8 @@ export interface XPostView {
 export interface StoryRef {
   publicId: string;
   title: string;
+  /** The event page stands in search (sourceCount >= STORY_INDEX_MIN_SOURCES). */
+  indexable?: boolean;
 }
 
 /** What every site answer about an article carries; a card and a page each add the X post in their own form. */
@@ -140,6 +142,8 @@ export interface TimelineResponse {
 export interface PoolResponse {
   filters: TimelineFilters & { q: string | null; tab: "time" | "relevance" };
   items: FeedItemSummary[];
+  /** Of the items' tags, each that is a topic's own, with that topic's slug. */
+  tagTopics?: Record<string, string>;
   page: number;
   pageCount: number;
   total: number;
@@ -264,11 +268,12 @@ export interface StoryFactView {
 }
 
 /**
- * An event page stands for its reports in search once it gathers this many public reports (reportCount):
- * with fewer it only repeats its one report's page, so it is noindex and neither the sitemap nor change
- * notifications list it; with as many, its reports' own pages leave Google to it (2026-11-09).
+ * An event page stands for its reports in search once at least this many distinct public editorial sources
+ * cover it (sourceCount): single-source clusters only repeat that source's own pages, so the event page is
+ * noindex and neither the sitemap nor change notifications list it; with multiple sources, its reports' own
+ * pages leave Google to the event page (2026-11-20; previously 2 reports regardless of source).
  */
-export const STORY_INDEX_MIN_REPORTS = 2;
+export const STORY_INDEX_MIN_SOURCES = 2;
 
 export interface StoryDetail {
   publicId: string;
@@ -520,6 +525,8 @@ export interface TopicPage {
   /** The site's modules' parts of the page, under their names; each module's web part draws its own. */
   modules: Record<string, unknown>;
   items: FeedItemSummary[];
+  /** Of the items' tags, each that is a topic's own, with that topic's slug. */
+  tagTopics?: Record<string, string>;
   page: number;
   pageCount: number;
   pageSize: number;

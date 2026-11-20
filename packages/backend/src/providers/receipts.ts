@@ -137,6 +137,15 @@ export function providerSpendingRefused(service: string, error: string): boolean
   return providerAccessRefused(service, error);
 }
 
+/**
+ * A provider's safety or content-inspection filter declined this input or output (Zhipu 1301,
+ * DashScope DataInspectionFailed, DeepSeek Content Exists Risk, OpenAI-compatible content_filter).
+ */
+export function providerContentRefused(error: unknown): boolean {
+  return failureKind(error) === "refused"
+    && /contentFilter|"1301"|DataInspectionFailed|data_inspection_failed|content_filter|Content Exists Risk/i.test((error as Error).message);
+}
+
 /** A temporary rate limit can pass; account/spending refusals need access restored first. */
 export function assertAccepted(service: string, status: number, body: string): void {
   if (status >= 200 && status < 300) return;
@@ -397,8 +406,10 @@ export async function releaseUnknownReceipt(db: Db, id: number, error: string): 
   return released ?? null;
 }
 
-export async function completeReceipt(db: Db, receiptId: number): Promise<void> {
+/** `storedElsewhere`: a top-level field of the answer the caller's write now keeps (embeddings: the vectors), dropped from the receipt. */
+export async function completeReceipt(db: Db, receiptId: number, storedElsewhere?: string): Promise<void> {
   await db`UPDATE receipts SET status = 'completed', completed_at = coalesce(completed_at, now()), updated_at = now() WHERE id = ${receiptId}`;
+  if (storedElsewhere) await db`UPDATE receipts SET response = response - ${storedElsewhere}::text WHERE id = ${receiptId}`;
 }
 
 /** Marks a received response that could not be used (e.g. unparsable) so a fresh attempt can be made. */

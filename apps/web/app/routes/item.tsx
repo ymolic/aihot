@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { Await, isRouteErrorResponse, Link, useAsyncError, useLoaderData, useNavigate, useRevalidator, type ClientLoaderFunctionArgs } from "react-router";
 import type { Route } from "./+types/item";
 import { REPORT_NAMES, reportDateLabel, type FeedItemSummary, type SiteItemDetail, type StoryFollowupsResponse } from "@aihot/contracts/site";
+import { CATEGORY_LABELS } from "@aihot/contracts/taxonomy";
 import { ITEM_COPY, SITE, withSubject } from "@aihot/site";
 import { linkMentions } from "@aihot/contracts/mentions";
 import { addressRuns } from "@aihot/contracts/addresses";
@@ -63,6 +64,7 @@ export function meta({ loaderData }: Route.MetaArgs) {
   if (!loaderData) return [{ title: titled("内容不存在") }, { name: "robots", content: "noindex" }];
   const { item } = loaderData;
   if (!item) return [{ title: titled(loaderData.preview.title) }];
+  const section = [...new Set([...(item.category ? [CATEGORY_LABELS[item.category]] : []), ...item.topics.map((t) => t.name)])];
   return pageMeta({
     title: item.title,
     description: item.summary ?? undefined,
@@ -72,7 +74,7 @@ export function meta({ loaderData }: Route.MetaArgs) {
     noindex: !item.indexable,
     googleNoindex: item.googleNoindex,
     jsonLd: [
-      articleLd({ path: `/items/${item.id}`, headline: item.title, description: item.summary, publishedAt: item.publishedAt ?? item.discoveredAt, image: `/og/items/${item.id}.png`, basedOn: item.links.original }),
+      articleLd({ path: `/items/${item.id}`, headline: item.title, description: item.summary, publishedAt: item.publishedAt ?? item.discoveredAt, image: `/og/items/${item.id}.png`, basedOn: item.links.original, section }),
       breadcrumbLd([
         { name: SITE.name, path: "/" },
         { name: item.selected ? "精选" : "全部动态", path: item.selected ? "/" : "/all" },
@@ -244,7 +246,7 @@ function ItemPreview({ preview }: { preview: FeedItemSummary }) {
     <div className="mx-auto max-w-[var(--page-max-reading)] pb-8">
       <PhoneBar back={{ to: preview.selected ? "/" : "/all", label: preview.selected ? "精选" : "全部" }} title={isPost ? preview.x!.authorName : preview.title} />
       <article className="pb-6 pt-3" aria-busy="true">
-        <div className="mb-3 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[13px] text-ink-3">
+        <div className={`flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[13px] text-ink-3 ${isPost ? "" : "mb-3"}`}>
           <span className="font-semibold text-ink-2">{isX ? preview.x!.authorName : preview.source.name}</span>
           {isX && <span>· @{preview.x!.handle} · X</span>}
           <span>·</span>
@@ -257,7 +259,7 @@ function ItemPreview({ preview }: { preview: FeedItemSummary }) {
             </span>
           )}
         </div>
-        {!isPost && <h1 data-page-title="" className="text-[26px] font-bold leading-[1.38] tracking-[-0.01em] text-ink">{preview.title}</h1>}
+        {isPost ? <h1 className="sr-only">{preview.title}</h1> : <h1 data-page-title="" className="text-[26px] font-bold leading-[1.38] tracking-[-0.01em] text-ink">{preview.title}</h1>}
         {preview.summary && (
           <section className={isPost ? "mt-4" : "mt-7"}>
             <div className="mb-2 text-[12px] font-semibold text-accent">{isPost && preview.summary.replace(/\s+/g, " ").trim() === preview.title ? "原文" : "AI 导读"}</div>
@@ -481,7 +483,7 @@ function ItemView({ item, followups }: Loaded) {
         <RailSection title="标签">
           <div className="flex flex-wrap gap-1.5">
             {tags.slice(0, 8).map(({ tag, to }) => (
-              <Link key={tag} to={to} className="chip">
+              <Link key={tag} to={to} rel={to.startsWith("/all?") ? "nofollow" : undefined} className="chip">
                 #{tag}
               </Link>
             ))}
@@ -558,7 +560,7 @@ function ItemView({ item, followups }: Loaded) {
               </span>
             )}
           </div>
-          {!isPost && <h1 data-page-title="" className="text-[26px] font-bold leading-[1.38] tracking-[-0.01em] text-ink lg:text-[32px] lg:leading-[1.34] xl:text-[36px] xl:leading-[1.3]">{item.title}</h1>}
+          {isPost ? <h1 className="sr-only">{item.title}</h1> : <h1 data-page-title="" className="text-[26px] font-bold leading-[1.38] tracking-[-0.01em] text-ink lg:text-[32px] lg:leading-[1.34] xl:text-[36px] xl:leading-[1.3]">{item.title}</h1>}
           {!isPost && item.originalTitle && <p className="mt-2.5 text-[14px] leading-relaxed text-ink-4">{item.originalTitle}</p>}
 
           {item.summary && (!isPost || item.summary.replace(/\s+/g, " ").trim() !== item.title) && (
@@ -591,7 +593,7 @@ function ItemView({ item, followups }: Loaded) {
             </div>
           )}
 
-          {summaryOnly && <p className="mt-7 rounded-control bg-bg-sunk px-4 py-3 text-[13.5px] leading-relaxed text-ink-3">应来源方要求，这里只提供摘要与原文入口。完整内容请阅读原文。</p>}
+          {summaryOnly && <p className="mt-7 rounded-control bg-bg-sunk px-4 py-3 text-[13.5px] leading-relaxed text-ink-3">本站只提供摘要与原文链接。</p>}
 
           {item.body && bodyHtml && (
             <section className="mt-9 border-t border-line pt-4 xl:mt-10">
@@ -641,7 +643,7 @@ function ItemView({ item, followups }: Loaded) {
                 </Link>
               ))}
               {tags.slice(0, 6).map(({ tag, to }) => (
-                <Link key={tag} to={to} className="chip">
+                <Link key={tag} to={to} rel={to.startsWith("/all?") ? "nofollow" : undefined} className="chip">
                   #{tag}
                 </Link>
               ))}

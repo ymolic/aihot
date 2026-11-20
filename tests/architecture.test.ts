@@ -82,6 +82,11 @@ const OWNERS: Record<string, string> = {
   story_digests: "events/", grouping_decisions: "events/", grouping_overrides: "events/",
   audit_log: "audit.ts",
   feedback_submission_state: "operations/feedback.ts",
+  reader_previewers: "../../../modules/accounts/backend/",
+  reader_sync_usage: "../../../modules/accounts/backend/",
+  reader_accounts: "../../../modules/accounts/backend/", reader_logins: "../../../modules/accounts/backend/",
+  reader_sessions: "../../../modules/accounts/backend/", reader_codes: "../../../modules/accounts/backend/",
+  reader_code_sends: "../../../modules/accounts/backend/", reader_data: "../../../modules/accounts/backend/",
 };
 
 test("the tables that carry a rule are written only by the code that owns it", () => {
@@ -174,7 +179,6 @@ const convertsBeijingTime = (line: string) =>
 const CONVERTS_BEIJING_TIME: Record<string, string> = {
   "packages/contracts/src/time.ts": "the conversions themselves",
   "packages/backend/src/editorial/analyze.ts": "the score input keeps the form its prompt was tuned on (whole seconds without .000)",
-  "packages/backend/src/editorial/writing.ts": "a beijingDate written out, left to the next change of editorial/",
   "site/changelog/FeatureRelease.tsx": "a changelog entry's Beijing date and time with its zone, to the minute, in dateTime",
   "clients/watchdog/watchdog.mjs": "installed as one file away from the repository, so it cannot import time.ts",
   "clients/mp-watch/articles.ts": "installed away from the repository with only its module's contracts, so it cannot import time.ts",
@@ -252,7 +256,7 @@ test("scripts read the reduced-motion preference only through lib/motion.ts", ()
   assert.deepEqual(found, [], "use reducedMotion() or scrollBehavior() from lib/motion.ts");
 });
 
-test("a gray page is the admin's alone: its loader goes through grayGet and answers with GRAY_HEADERS", async () => {
+test("a gray page is only for previewers: its loader goes through grayGet and answers with GRAY_HEADERS", async () => {
   const { MODULES } = await import("@aihot/site/modules");
   const gray = MODULES.flatMap((m) => (m.pages ?? []).flatMap((p) => ("layout" in p ? p.pages : [p])).filter((p) => p.gray).map((p) => `modules/${m.name}/${p.file}`));
   for (const file of gray) {
@@ -270,4 +274,19 @@ test("pages are prefetched only through IntentLink", () => {
       && /\bprefetch\s*=|\bprefetch\s*:\s*["'`]|PrefetchPageLinks|rel=["']prefetch/.test(line))
     .map(({ at }) => at);
   assert.deepEqual(found, [], "link with IntentLink (in PillTabs, prefetchOnPress), which prefetches when the reader presses");
+});
+
+test("admin page loaders use adminPageGet and GRAY_HEADERS", async () => {
+  const { MODULES } = await import("@aihot/site/modules");
+  const pages = MODULES.flatMap((m) => (m.pages ?? []).flatMap((p) => ("layout" in p ? p.pages : [p])).filter((p) => p.admin).map((p) => `modules/${m.name}/${p.file}`));
+  for (const file of pages) {
+    const text = readFileSync(path.join(ROOT, file), "utf8");
+    assert.ok(/\badminPageGet\b/.test(text) && /\bGRAY_HEADERS\b/.test(text), `${file} must use adminPageGet and GRAY_HEADERS`);
+  }
+});
+
+// Animations use Presence.tsx (CSS keyframes) or the Web Animations API, not a runtime animation library.
+test("web code does not import motion or framer-motion", () => {
+  const found = violations([...sources("apps/web"), ...moduleWeb(), ...sources("site")], (_file, spec) => /^(?:motion|framer-motion)(?:$|\/)/.test(spec));
+  assert.deepEqual(found, [], "animate with Presence.tsx, CSS keyframes or the Web Animations API instead of motion");
 });

@@ -2,14 +2,14 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode }
 import { IntentLink } from "../components/ui/IntentLink";
 import { Link, useLoaderData, useLocation } from "react-router";
 import type { Route } from "./+types/story";
-import { STORY_INDEX_MIN_REPORTS, type StoryDetail, type StoryReportView } from "@aihot/contracts/site";
+import { STORY_INDEX_MIN_SOURCES, type StoryDetail, type StoryReportView } from "@aihot/contracts/site";
 import { SITE } from "@aihot/site";
 import { linkMentions } from "@aihot/contracts/mentions";
 import { addressRuns } from "@aihot/contracts/addresses";
 import { MentionText } from "../components/ui/MentionText";
 import { cachedPage, loadOr404 } from "../lib/api.server";
 import { pageReuse } from "../lib/page-reuse";
-import { breadcrumbLd, pageMeta, storyLd, titled } from "../lib/seo";
+import { breadcrumbLd, pageMeta, storyArticleLd, storyLd, titled } from "../lib/seo";
 import { beijingDate, beijingTime } from "@aihot/contracts/time";
 import { byBeijingDay, monthDay, monthDayTime, relativeTime } from "../lib/format";
 import { useCurrentSection } from "../lib/motion";
@@ -38,16 +38,18 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 export function meta({ loaderData }: Route.MetaArgs) {
   if (!loaderData) return [{ title: titled("事件不存在") }, { name: "robots", content: "noindex" }];
   const s = loaderData.story;
+  const article = storyArticleLd(s);
   return pageMeta({
     title: s.title,
     description: (s.digest ?? s.summary ?? s.excerpt?.text)?.slice(0, 150) ?? `${s.sourceCount} 个报道来源 ${s.reportCount} 篇报道，完整时间线与最新进展。`,
     path: `/story/${s.publicId}`,
     image: `/og/stories/${s.publicId}.png`,
     type: "article",
-    // With one report the page only repeats that report's own page, which stands in search instead.
-    noindex: s.reportCount < STORY_INDEX_MIN_REPORTS,
+    // Single-source clusters only repeat that source's own pages, which stand in search instead.
+    noindex: s.sourceCount < STORY_INDEX_MIN_SOURCES,
     jsonLd: [
       storyLd(s),
+      ...(article ? [article] : []),
       breadcrumbLd([{ name: SITE.name, path: "/" }, ...UP.crumbs, { name: s.title, path: `/story/${s.publicId}` }]),
     ],
   });

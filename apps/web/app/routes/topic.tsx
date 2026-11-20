@@ -73,7 +73,9 @@ export function meta({ loaderData }: Route.MetaArgs) {
     description: text,
     path,
     image: `/og/topics/${topic.slug}.png`,
-    noindex: !topic.indexable,
+    // The first page stands in search for the topic; archive pages (/page/2+) shift reports along, and
+    // their links stay followed so every report is still reached (aligned with /all?page=2+).
+    noindex: !topic.indexable || page > 1,
     jsonLd: page > 1
       ? crumbs
       : [
@@ -146,7 +148,7 @@ export default function TopicRoute() {
           <EmptyState title="这个主题暂时还没有精选内容" />
         </div>
       ) : (
-        <DayList items={items} headerAside={<span className="num whitespace-nowrap">第 {first}–{last} 条<span className="hidden sm:inline"> · 共 {topic.total.toLocaleString("zh-CN")} 条</span></span>} />
+        <DayList items={items} tagTopics={data.tagTopics} currentTopicSlug={topic.slug} headerAside={<span className="num whitespace-nowrap">第 {first}–{last} 条<span className="hidden sm:inline"> · 共 {topic.total.toLocaleString("zh-CN")} 条</span></span>} />
       )}
       <Pagination page={page} pageCount={pageCount} href={href} />
     </div>

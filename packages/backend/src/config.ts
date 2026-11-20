@@ -42,6 +42,11 @@ export const config = {
   // Every generated absolute link uses this address, whatever Host a request arrives with.
   siteUrl: str("SITE_URL", SITE.defaultUrl).replace(/\/+$/, ""),
   egressProxyUrl: env.EGRESS_PROXY_URL || null,
+  /** DoH upstreams for resolving proxied hostnames, tried in order; default keeps the original first. */
+  egressDnsUpstreams: (env.EGRESS_DNS_UPSTREAMS || "https://cloudflare-dns.com/dns-query, https://dns.google/resolve")
+    .split(",").map((v) => v.trim()).filter(Boolean),
+  /** false: after the public-address check, CONNECT carries the hostname and the proxy resolves it. */
+  egressPinDns: env.EGRESS_PIN_DNS !== "false",
   allowPrivateNetworkFetch: bool("ALLOW_PRIVATE_NETWORK_FETCH", false),
   /** Whole host names of self-hosted feed services on private addresses; only listing fetches use them. */
   privateFeedHosts: (env.PRIVATE_FEED_HOSTS || "").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean),
@@ -62,10 +67,8 @@ export const config = {
   // worker).
   modelCallsEnabled: bool("MODEL_CALLS_ENABLED", false),
   devAdmin: env.DEV_AUTH_ROLE === "admin" ? { displayName: env.DEV_AUTH_DISPLAY_NAME || "Dev Admin" } : null,
-  /** The admin password (at least 12 characters). Feishu sign-in below is optional. */
+  /** The admin password (at least 12 characters), for sites with admin pages. */
   adminPassword: env.ADMIN_PASSWORD || null,
-  adminUnionIds: (env.ADMIN_FEISHU_UNION_IDS || "").split(",").map((v) => v.trim()).filter(Boolean),
-  adminEmails: (env.ADMIN_EMAILS || "").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean),
 };
 
 export type CredentialGroup = "models" | "collectors" | "integrations" | "auth";
