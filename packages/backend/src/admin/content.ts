@@ -13,7 +13,8 @@ import { identityKeyForUrl, normalizeUrl } from "../lib/url.ts";
 import { publishArticleTx, setSeoDecision } from "../publication/publish.ts";
 import { emit } from "../modules.ts";
 import { requestRegroup } from "../events/corrections.ts";
-import { resetAutomatic, syncArticleEventCopyTx } from "../events/group.ts";
+import { syncArticleEventCopyTx } from "../events/copy.ts";
+import { resetAutomatic } from "../events/group.ts";
 import { materialIdentityForUrl, contentHash, decideTimeline, explicitBackfill, isHistorical, updatePresentation, type MediaItem } from "../content/materials.ts";
 import { extractFromUrl, pageFetchable, pageRules } from "../content/extract.ts";
 import { PresentationMismatch, presentationCounts, rebaseTranslation } from "../content/presentation.ts";
@@ -218,7 +219,7 @@ export async function contentChain(id: string): Promise<Chain | null> {
       SELECT fa.fact_id, fa.role, fa.manual, f.public_id AS fact_public_id, f.title AS fact_title, st.id AS story_id, st.public_id AS story_public_id, st.title AS story_title
       FROM fact_articles fa JOIN facts f ON f.id = fa.fact_id LEFT JOIN stories st ON st.id = f.story_id WHERE fa.article_id = ${id}`,
     sql<Chain["decisions"]>`SELECT verdict, fact_id, story_id, receipt_id, candidates, created_at FROM grouping_decisions WHERE article_id = ${id} ORDER BY created_at DESC LIMIT 5`,
-    sql<Chain["deliveries"]>`SELECT target_key, dedupe_key, status, attempts, response, created_at, sent_at FROM deliveries WHERE subject_id = ${id} ORDER BY created_at DESC`,
+    sql<Chain["deliveries"]>`SELECT target_key, dedupe_key, status, attempts, response, created_at, sent_at FROM deliveries WHERE subject_kind = 'selected' AND subject_id = ${id} ORDER BY created_at DESC`,
     auditHistory(`content:${id}`),
   ]);
   return { article, discoveries, revisions, analyses, publication: publication[0] ?? null, override: override[0] ?? null, ledger, membership, decisions, deliveries, history };

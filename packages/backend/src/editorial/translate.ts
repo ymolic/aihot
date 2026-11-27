@@ -196,8 +196,8 @@ async function suppressFromTranslation(articleId: string, revision: number, rece
 }
 
 export async function translateArticle(articleId: string, expectedRevision?: number): Promise<TranslateResult> {
-  const [row] = await sql<{ revision: number; channel: string; language: string | null; body_html: string | null; body_text: string | null; x_post: { text?: string } | null; x_article: { title?: string; text?: string; html?: string } | null; title: string; selected: boolean; body_mode: string; suppress_original: boolean; visibility: string }[]>`
-    SELECT a.revision, p.channel, a.language, a.body_html, a.body_text, a.x_post, a.x_article, p.title, p.selected, p.body_mode, p.suppress_original, p.visibility
+  const [row] = await sql<{ revision: number; channel: string; language: string | null; body_html: string | null; body_text: string | null; x_post: { text?: string } | null; x_article: { title?: string; text?: string; html?: string } | null; title: string; selected: boolean; body_mode: string; visibility: string }[]>`
+    SELECT a.revision, p.channel, a.language, a.body_html, a.body_text, a.x_post, a.x_article, p.title, p.selected, p.body_mode, p.visibility
     FROM publications p JOIN articles a ON a.id = p.article_id WHERE p.article_id = ${articleId}
       AND (${expectedRevision ?? null}::int IS NULL OR a.revision = ${expectedRevision ?? null})`;
   if (!row) return { articleId, revision: expectedRevision, status: "skipped", reason: "not published at the requested revision" };
@@ -207,7 +207,7 @@ export async function translateArticle(articleId: string, expectedRevision?: num
     for (const id of new Set(receiptIds)) await rejectReceivedResponse(id, `unusable translation: ${reason}`);
     return result({ status: "failed", reason });
   };
-  if (!row.selected || row.visibility !== "public" || row.body_mode !== "full" || row.suppress_original) {
+  if (!row.selected || row.visibility !== "public" || row.body_mode !== "full") {
     return result({ status: "skipped", reason: "not a selected full-text item" });
   }
   const reviewer = editorialPolicy().reviewTranslation;
@@ -399,9 +399,9 @@ export async function translateQuotes(opts: { days?: number; limit?: number; bud
          -- A post with a saved long article is translated as that article: its translation is not the post's words.
          AND coalesce(o.x_article->>'text', '') = '') AS own_zh
     FROM publications p JOIN articles a ON a.id = p.article_id
-    CROSS JOIN LATERAL (SELECT substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)') AS tweet_id) q
+    CROSS JOIN LATERAL (SELECT coalesce(a.x_post->'quoted'->>'tweetId', substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)')) AS tweet_id) q
     LEFT JOIN quote_translations qt ON qt.tweet_id = q.tweet_id
-    WHERE p.channel = 'x' AND p.selected AND p.visibility = 'public' AND p.body_mode = 'full' AND NOT p.suppress_original
+    WHERE p.channel = 'x' AND p.selected AND p.visibility = 'public' AND p.body_mode = 'full'
       AND p.discovered_at > now() - make_interval(days => ${opts.days ?? 3})
       AND q.tweet_id IS NOT NULL AND coalesce(a.x_post->'quoted'->>'text', '') <> ''
     ORDER BY q.tweet_id, p.discovered_at DESC`;
@@ -409,7 +409,7 @@ export async function translateQuotes(opts: { days?: number; limit?: number; bud
   const suppressCiting = async (tweetId: string, receiptIds: number[], reason: string) => {
     const cited = await sql<{ id: string; revision: number }[]>`
       SELECT a.id, a.revision FROM articles a JOIN publications p ON p.article_id = a.id
-      WHERE substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)') = ${tweetId} AND NOT p.suppress_original`;
+      WHERE coalesce(a.x_post->'quoted'->>'tweetId', substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)')) = ${tweetId} AND NOT p.suppress_original`;
     for (const { id, revision } of cited) await suppressFromTranslation(id, revision, [], reason);
     if (receiptIds.length) {
       await sql.begin(async (tx) => {
@@ -469,7 +469,7 @@ export async function translateQuotes(opts: { days?: number; limit?: number; bud
       if (saved.length) {
         const cited = await tx<{ id: string }[]>`
           SELECT a.id FROM articles a JOIN publications p ON p.article_id = a.id
-          WHERE substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)') = ${r.tweet_id}`;
+          WHERE coalesce(a.x_post->'quoted'->>'tweetId', substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)')) = ${r.tweet_id}`;
         for (const { id } of cited) await emit("articleChanged", { id, kind: "body", reason: "quoted post translation" }, tx);
       }
       for (const id of new Set(allReceipts)) await completeReceipt(tx, id);
@@ -493,7 +493,7 @@ export async function translatePending(opts: { limit?: number; budgetMs?: number
       CASE WHEN p.channel='x' THEN coalesce(nullif(a.x_article->>'text',''),a.x_post->>'text',a.body_text) ELSE a.body_text END AS text
     FROM publications p JOIN articles a ON a.id = p.article_id
     LEFT JOIN translations tr ON tr.article_id = p.article_id AND tr.lang = 'zh'
-    WHERE p.selected AND p.visibility = 'public' AND p.body_mode = 'full' AND NOT p.suppress_original
+    WHERE p.selected AND p.visibility = 'public' AND p.body_mode = 'full'
       AND (p.channel='x' OR a.body_html IS NOT NULL)
       AND (p.discovered_at > now() - interval '3 days'
            OR EXISTS (SELECT 1 FROM article_revisions r WHERE r.article_id = a.id AND r.revision = a.revision AND r.revision > 1

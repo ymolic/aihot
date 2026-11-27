@@ -11,6 +11,12 @@ import { sql, type Db } from "../db.ts";
 import { sha256, stableJson } from "../lib/ids.ts";
 import { shutdownSignal } from "../lib/shutdown.ts";
 
+export const AUTO_RELEASE_NOTE = "自动放行：结果未知超过 30 分钟，未核对是否计费";
+
+/** Whether receipt r has used its automatic release, including attempts recorded before the flag. */
+export const alreadyAutoReleased = sql`EXISTS (SELECT 1 FROM receipt_attempts a WHERE a.receipt_id = r.id
+  AND (a.auto_released OR a.error LIKE ${AUTO_RELEASE_NOTE + "%"}))`;
+
 /** The text of a spent budget's error; with `%` for both parts it is the LIKE pattern that finds every saved one. */
 export const budgetMessage = (service: string, window: string) => `Budget for ${service} exhausted (${window})`;
 
@@ -399,10 +405,13 @@ export function awaitingRelease(receipt: ReturnType<typeof sql> = sql`receipts`)
  * Releases an unknown receipt: marked failed, so the next attempt of its request calls again (who
  * releases and when: operations/recover.ts). Null when the receipt is not, or no longer, unknown.
  */
-export async function releaseUnknownReceipt(db: Db, id: number, error: string): Promise<{ subject: string | null; purpose: string } | null> {
+export async function releaseUnknownReceipt(db: Db, id: number, error: string, opts: { autoReleased?: boolean } = {}): Promise<{ subject: string | null; purpose: string } | null> {
   const [released] = await db<{ subject: string | null; purpose: string }[]>`
     UPDATE receipts SET status = 'failed', error = ${error}, updated_at = now() WHERE id = ${id} AND status = 'unknown' RETURNING subject, purpose`;
-  if (released) await db`UPDATE receipt_attempts SET status = 'failed', error = ${error} WHERE receipt_id = ${id} AND status = 'unknown'`;
+  if (released) {
+    await db`UPDATE receipt_attempts SET status = 'failed', error = ${error}, auto_released = ${opts.autoReleased === true}
+             WHERE receipt_id = ${id} AND status = 'unknown'`;
+  }
   return released ?? null;
 }
 

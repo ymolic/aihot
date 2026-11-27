@@ -1,11 +1,12 @@
 // Small building blocks shared by feed items, detail pages and lists.
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { FeedItemSummary, MediaView } from "@aihot/contracts/site";
 import { IconBookmark } from "../../components/icons";
 import { SourceAvatar } from "../../components/ui/SourceAvatar";
 import { Lightbox } from "../../components/ui/Lightbox";
 import { Picture } from "../../components/ui/Picture";
 import { toggleStar, useIsStarred } from "../../lib/local-state";
+import { useT } from "../../lib/i18n";
 
 /** The source's name, or, for X, avatar + display name + @handle. */
 /** The text colour of a report: grey once this browser has opened it, so the unread ones stand out. */
@@ -26,17 +27,21 @@ export function SourceLine({ item, className = "" }: { item: Pick<FeedItemSummar
 
 /** Up to four media thumbnails, kept small in lists (the detail page shows them larger). Videos are stills. */
 export function MediaThumbs({ media, className = "" }: { media: MediaView[]; className?: string }) {
+  const t = useT();
   const [index, setIndex] = useState<number | null>(null);
-  const images = media.filter((m) => m.kind === "image").map((m) => ({ src: m.fullUrl ?? m.url, alt: m.alt }));
+  const row = useRef<HTMLDivElement>(null);
+  const imageItems = media.filter((m) => m.kind === "image");
+  const images = imageItems.map((m) => ({ src: m.fullUrl ?? m.url, alt: m.alt }));
   const shown = media.slice(0, 4);
   if (shown.length === 0) return null;
   return (
     <>
-    <div className={`flex gap-1.5 overflow-hidden ${className}`}>
-      {shown.map((m) => {
+    <div ref={row} className={`flex gap-1.5 overflow-hidden ${className}`}>
+      {shown.map((m, i) => {
         const Wrapper = m.kind === "image" ? "button" : "span";
+        const imageIndex = m.kind === "image" ? imageItems.indexOf(m) : -1;
         return (
-        <Wrapper key={m.url} {...(m.kind === "image" ? { type: "button" as const, "aria-label": `查看图片${m.alt ? `：${m.alt}` : ""}`, onClick: (e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); setIndex(images.findIndex((image) => image.src === (m.fullUrl ?? m.url))); } } : {})} className={`relative ${m.kind === "image" ? "z-10 cursor-zoom-in" : ""} shrink-0 overflow-hidden rounded-control border border-line-soft bg-bg-sunk ${shown.length === 1 ? "max-w-[240px]" : "w-[112px]"}`}>
+        <Wrapper key={`${m.url}#${i}`} {...(m.kind === "image" ? { type: "button" as const, "aria-label": t(`查看图片${m.alt ? `：${m.alt}` : ""}`, `View image${m.alt ? `: ${m.alt}` : ""}`), onClick: (e: React.MouseEvent) => { e.preventDefault(); e.stopPropagation(); setIndex(imageIndex); } } : {})} className={`relative ${m.kind === "image" ? "z-10 cursor-zoom-in" : ""} shrink-0 overflow-hidden rounded-control border border-line-soft bg-bg-sunk ${shown.length === 1 ? "max-w-[240px]" : "w-[112px]"}`}>
           <Picture src={m.poster ?? m.url} srcSet={m.srcSet} sizes={shown.length === 1 ? `${m.width && m.height ? Math.min(240, Math.ceil(112 * m.width / m.height)) : 240}px` : "112px"} width={m.width ?? undefined} height={m.height ?? undefined} alt={m.alt ?? ""} loading="lazy" decoding="async" className={`h-[112px] object-cover ${shown.length === 1 ? "w-auto max-w-[240px]" : "w-[112px]"}`} />
           {m.kind === "video" && (
             <span className="absolute inset-0 grid place-items-center" aria-hidden="true">
@@ -50,7 +55,7 @@ export function MediaThumbs({ media, className = "" }: { media: MediaView[]; cla
         </Wrapper>
       ); })}
     </div>
-    <Lightbox images={images} index={index} onIndex={setIndex} onClose={() => setIndex(null)} />
+    <Lightbox images={images} index={index} onIndex={setIndex} onClose={() => setIndex(null)} origin={(i) => row.current?.querySelectorAll("button")[i]} />
     </>
   );
 }
@@ -74,18 +79,20 @@ export function useStar(item: Starrable) {
 /** Bookmark toggle kept in this browser (收藏): 26px, or sized by `className`. */
 export function StarButton({ item, className = "size-[26px]" }: { item: Starrable; className?: string }) {
   const { on, toggle, pulse } = useStar(item);
+  const t = useT();
+  const label = on ? t("取消收藏", "Remove from Saved") : t("收藏", "Save");
   return (
     <button
       type="button"
       aria-pressed={on}
-      aria-label={on ? "取消收藏" : "收藏"}
-      title={on ? "取消收藏" : "收藏"}
+      aria-label={label}
+      title={label}
       onClick={(e) => {
         e.preventDefault();
         e.stopPropagation();
         toggle();
       }}
-      className={`relative z-10 inline-flex shrink-0 items-center justify-center rounded-control transition-colors duration-150 ${on ? "text-accent" : "text-ink-4 hover:bg-bg-sunk hover:text-ink-2"} ${className}`}
+      className={`relative z-10 inline-flex shrink-0 items-center justify-center rounded-control press ${on ? "text-accent" : "text-ink-4 hover:bg-bg-sunk hover:text-ink-2"} ${className}`}
     >
       <span key={pulse} className={`flex ${pulse ? "anim-bump" : ""}`}>
         <IconBookmark size={16} filled={on} />

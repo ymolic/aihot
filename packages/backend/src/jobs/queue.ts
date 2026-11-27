@@ -25,7 +25,7 @@ export interface JobData {
   "sources.mp": { sourceId: string; reason?: "schedule" | "manual" };
   "notify.selected": { articleId: string; attempt?: number };
   "publication.republish-source": { sourceId: string };
-  "media.prepare": { articleId: string } | { url: string; mode: string; format?: "avif" };
+  "media.prepare": { articleId: string } | { url: string; mode: string; format?: "avif" | "mp4" };
 }
 export type QueueName = keyof JobData;
 
@@ -41,6 +41,15 @@ export const QUEUES = {
   republishSource: "publication.republish-source",
   prepareMedia: "media.prepare",
 } as const satisfies Record<string, QueueName>;
+
+/**
+ * Queue order (pg-boss serves higher priority first): live work before history, so a new source's
+ * first import or a backfill never holds up today's news; discussion evidence waits behind reports
+ * in the serial grouping queue, history behind both.
+ */
+export function articlePriority({ historical, signal = false }: { historical: boolean; signal?: boolean }): number {
+  return historical ? -2 : signal ? -1 : 0;
+}
 
 export type QueueOptions = NonNullable<Parameters<PgBoss["createQueue"]>[1]>;
 

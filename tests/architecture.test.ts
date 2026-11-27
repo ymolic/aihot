@@ -4,10 +4,34 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { assertNoViolations, sourceFiles } from "./source-checks.ts";
+import { presentationAssertions, rawLoaderPaths } from "./lesson-checks.ts";
+import { clockViolationsByFile } from "./test-clock.ts";
 import { after, test } from "node:test";
+import { fontSizeViolations } from "./font-size.ts";
+import { cssMotionTokens, motionViolations } from "./motion.ts";
+import { routerLinkViolations, webTextViolations } from "./web-text.ts";
+import { ARTICLE_ID_PATTERN } from "@aihot/contracts/taxonomy";
 import { closeDb, sql } from "@aihot/backend/db";
 
 after(closeDb);
+
+test("test fixtures and identities do not depend on the wall clock", () => {
+  assertNoViolations(clockViolationsByFile());
+});
+
+test("page loaders identify document and data requests by the same pathname", async () => {
+  const { pagePathname } = await import("../apps/web/app/lib/api.server.ts");
+  for (const [document, data] of [["/", "/_.data"], ["/example", "/example.data"], ["/example/2026-11", "/example/2026-11.data"]]) {
+    for (const path of [document, data]) assert.equal(pagePathname(new Request(`https://example.org${path}?page=2`)), document);
+  }
+  const found = rawLoaderPaths();
+  assert.deepEqual(found, [], found.join("\n"));
+});
+
+test("browser assertions describe visible behavior", () => {
+  assertNoViolations(presentationAssertions());
+});
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const BACKEND = "packages/backend/src";
@@ -32,6 +56,13 @@ function sources(dir: string, kind = /\.tsx?$/): Array<{ file: string; text: str
 /** Module specifiers a file imports (static, dynamic and type imports). */
 const specifiers = (text: string) => [...text.matchAll(/\b(?:from|import)\s*\(?\s*["']([^"']+)["']/g)].map((m) => m[1]!);
 
+test("browser suites run in the web checks before the parallel backend tests", () => {
+  const misplaced = sourceFiles("*.test.ts").filter(file =>
+    /^(?:modules\/[^/]+\/)?tests\//.test(file)
+    && /\b(?:chromium|firefox|webkit)\.launch\s*\(/.test(readFileSync(path.join(ROOT, file), "utf8")));
+  assert.deepEqual(misplaced, [], `请把使用浏览器的测试放进 apps/web/tests 或本模块的 web/tests，随网页测试顺序运行：\n${misplaced.join("\n")}`);
+});
+
 /** A specifier as a path under packages/backend/src (`events/group.ts`), or null outside the backend. */
 function backendPath(file: string, spec: string): string | null {
   if (spec.startsWith("@aihot/backend/")) return `${spec.slice("@aihot/backend/".length)}.ts`;
@@ -54,6 +85,14 @@ test("packages never import the apps, and nothing below the admin imports it", (
   const found = violations([...sources("packages/backend/src"), ...sources("apps/worker")], (file, spec) =>
     !file.startsWith("packages/backend/src/admin/") && (backendPath(file, spec)?.startsWith("admin/") ?? false));
   assert.deepEqual(found, [], "admin/ is the top layer: move what others need to the folder that owns it");
+});
+
+test("editorial and event code can enqueue work without loading worker implementations", () => {
+  const found = violations([...sources(BACKEND + "/editorial"), ...sources(BACKEND + "/events")], (file, spec) => {
+    const target = backendPath(file, spec);
+    return !!target?.startsWith("jobs/") && target !== "jobs/queue.ts";
+  });
+  assert.deepEqual(found, [], "submit work through jobs/queue.ts; worker implementations depend on editorial and events");
 });
 
 // Public routes read through the public read faces; the rest are the reader's own writes (feedback) and
@@ -110,6 +149,31 @@ test("the public scope and the composite rule are spelled once, in publication/s
   assert.deepEqual(found, [], "use the predicates of publication/scope.ts");
 });
 
+test("public article lists share their fields and browse predicate", () => {
+  const found: string[] = [];
+  for (const { file, text } of [...sources(BACKEND), ...sources("apps/api/src"), ...modules()]) {
+    // A SELECT can follow a CTE or contain an optional SQL fragment. Inspect each field list separately.
+    for (const match of text.matchAll(/(?:\bSELECT\s+|sql`)([^;`]*?)\bFROM\b|(?:\bSELECT\s+|sql`)([^;`]+?)`/gi)) {
+      const projection = match[1] ?? match[2]!;
+      if (/\bp\.article_id\s+AS\s+id\b/i.test(projection) && ["p.title", "p.summary", "p.url", "p.category", "p.published_at", "s.name"].every(c => projection.includes(c))
+        && !(file === `${BACKEND}/publication/items.ts` && text.slice(0, match.index).endsWith("PUBLIC_ITEM_COLUMNS = "))) {
+        found.push(`${file}:${text.slice(0, match.index).split("\n").length} 请引用 publication/items.ts 的 PUBLIC_ITEM_COLUMNS`);
+      }
+    }
+    if (file !== `${BACKEND}/publication/scope.ts` && /\bp\.score\s*(?:>=|>)\s*\$\{SELECTION\.browseFloor\}/.test(text)) {
+      found.push(`${file} 请使用 publication/scope.ts 的 browsedCondition`);
+    }
+  }
+  assert.deepEqual(found, [], found.join("\n"));
+});
+
+test("WeChat post identity is decoded only by lib/url.ts", () => {
+  const duplicates = [...sources(BACKEND), ...modules()].filter(({ file, text }) => file !== `${BACKEND}/lib/url.ts`
+    && /(?:searchParams\.(?:get|set)\(\s*["']__biz["']|\[\s*["']__biz["']\s*,\s*["']mid["']\s*,\s*["']idx["'])/.test(text));
+  assert.deepEqual(duplicates.map(({ file }) => file), [],
+    "使用 wechatPostUrl 读取公众号文章编号，使用 materialIdentityForUrl 查历史签名或短链；采集列表和入库统一用 resolveMaterialIdentity");
+});
+
 // Nothing kept that nothing uses. Stored state and settings outlive the code that used them, and an
 // unread field still costs a query; each check names what to delete. They compare names, so a column
 // whose name its table's code also uses for something else slips through. Tests, fixtures and local
@@ -121,6 +185,12 @@ const modules = (kind?: RegExp) => (existsSync(path.join(ROOT, "modules")) ? sou
 const moduleWeb = (kind?: RegExp) => modules(kind).filter(({ file }) => /^modules\/[^/]+\/web(?:\.|\/)/.test(file));
 const production = () => [...PRODUCTION.flatMap((dir) => sources(dir)), { file: "apps/web/server.ts", text: readFileSync(path.join(ROOT, "apps/web/server.ts"), "utf8") }, ...modules()];
 const words = (text: string) => new Set(text.match(/[A-Za-z_][A-Za-z0-9_]*/g));
+
+test("article identifiers use the same format at every entry point", () => {
+  const copies = production().filter(({ file, text }) =>
+    file !== "packages/contracts/src/taxonomy.ts" && text.includes(ARTICLE_ID_PATTERN.toString()));
+  assert.deepEqual(copies.map(({ file }) => file), [], "请引用 @aihot/contracts/taxonomy 的 ARTICLE_ID_PATTERN 校验文章编号");
+});
 
 test("every table and column is used by the code that reads and writes the database", async () => {
   const files = [...["packages/backend/src", "apps/api/src", "apps/worker/src"].flatMap((dir) => sources(dir)), ...modules()].map(({ text }) => words(text));
@@ -213,10 +283,17 @@ test("modules do not import other modules", () => {
 // The web's own code: the app, the modules' pages, and the site's pages and drawings, stylesheets included.
 // Each line is read without its comments: a word in a comment is neither a class nor a call.
 const WEB_CODE = /\.(?:tsx?|css)$/;
-const webLines = () => [...sources("apps/web/app", WEB_CODE), ...moduleWeb(WEB_CODE), ...sources("site", WEB_CODE)].flatMap(({ file, text }) =>
+const webSources = (kind = WEB_CODE) => [...sources("apps/web/app", kind), ...moduleWeb(kind), ...sources("site", kind)];
+const webLines = () => webSources().flatMap(({ file, text }) =>
   text.split("\n")
     .map((line, i) => ({ file, at: `${file}:${i + 1}`, line: line.replace(/\/\*.*?\*\//g, "").replace(/(^|\s)\/\/.*$/, "") }))
     .filter(({ line }) => !/^\s*(\/\/|\/\*|\*)/.test(line)));
+
+test("navigation visibility is defined in shell/nav.ts", () => {
+  const outside = webLines().filter(({ file, line }) => file !== "apps/web/app/components/shell/nav.ts"
+    && /\b(?:NAV\.hidden|inNav\s*\()/.test(line)).map(({ at }) => at);
+  assert.deepEqual(outside, [], "请从 shell/nav.ts 引用导航项的可见状态，需要新的入口时在那里按站点设置定义一次");
+});
 
 // Corners come from the radius scale in app.css (mark 5, control 8, tile 10, card 12, panel 14, sheet 16
 // pixels) or are pills (full); none takes a corner away. Before the scale, 77 hand-written radii in 12
@@ -244,6 +321,12 @@ test("the clipboard is written only through lib/clipboard.ts", () => {
     .filter(({ file, line }) => file !== "apps/web/app/lib/clipboard.ts" && /navigator\.clipboard|execCommand\(\s*["']copy/.test(line))
     .map(({ at }) => at);
   assert.deepEqual(found, [], "copy with copyText from lib/clipboard.ts");
+});
+
+test("components use React's layout effect directly", () => {
+  const environmentChoice = /typeof\s+window\s*[!=]==?\s*["']undefined["']\s*\?\s*(?:(?:[\w.]+|\(\s*\)\s*=>\s*\{\s*\})\s*:\s*)?(?:React\.)?useLayoutEffect\b/;
+  const copies = webSources(/\.tsx?$/).filter(({ text }) => environmentChoice.test(text));
+  assert.deepEqual(copies.map(({ file }) => file), [], "直接使用 React 的 useLayoutEffect，服务端渲染会跳过它");
 });
 
 // Scripts read the reader's reduced-motion preference through apps/web/app/lib/motion.ts (reducedMotion,
@@ -285,8 +368,34 @@ test("admin page loaders use adminPageGet and GRAY_HEADERS", async () => {
   }
 });
 
-// Animations use Presence.tsx (CSS keyframes) or the Web Animations API, not a runtime animation library.
+// Animations use Presence.tsx (CSS transitions), CSS keyframes or the Web Animations API, not a runtime animation library.
 test("web code does not import motion or framer-motion", () => {
   const found = violations([...sources("apps/web"), ...moduleWeb(), ...sources("site")], (_file, spec) => /^(?:motion|framer-motion)(?:$|\/)/.test(spec));
   assert.deepEqual(found, [], "animate with Presence.tsx, CSS keyframes or the Web Animations API instead of motion");
+});
+
+test("web font sizes use the design scale", () => {
+  assertNoViolations(fontSizeViolations());
+});
+
+// One motion language (app.css, "Motion"): curves and lengths come from its tokens, animation classes exist,
+// smooth scrolling respects reduced motion. Written by hand it had drifted into a dozen curves and timings.
+test("web motion uses the site's curves and lengths", () => {
+  assertNoViolations(motionViolations());
+});
+
+test("lib/motion.ts repeats app.css's motion tokens for scripts", async () => {
+  const { MOTION } = await import("../apps/web/app/lib/motion.ts");
+  assert.deepEqual({ ...MOTION }, cssMotionTokens(), "change the length or curve in app.css and lib/motion.ts together");
+});
+
+// The English edition (/en/…): reader-facing text is written in both languages where it is used, so a page
+// never shows Chinese to an English reader or loses its English when the Chinese is edited (lib/i18n.ts).
+// Pages without an English edition are listed in web-text.ts CHINESE_ONLY with the reason.
+test("reader-facing web text has its English beside it", () => {
+  assertNoViolations(webTextViolations());
+});
+
+test("site links keep the page's language", () => {
+  assertNoViolations(routerLinkViolations());
 });

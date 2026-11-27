@@ -6,6 +6,7 @@
 // pages, METR, Ollama, often with a version in its address; arXiv's logo on every paper, while its home page
 // declares none), or the picture of a whole changelog page shared by its entries. An image service's address
 // (/_next/image?url=…) names its picture in the query: IBM Research's and Sierra's covers are not their home's.
+import { load } from "cheerio";
 import { tag } from "./setup.ts";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -82,9 +83,13 @@ test("the site's own share picture, a section's or another article's, and a chan
   assert.equal(await articleCover(null, `${news.url}/blog/post`, `${news.url}/blog/post`), null);
 
   const sourceId = `cover-papers-${T}`;
-  await sql`INSERT INTO sources (id, name, kind, tier, participation_mode, next_fetch_at) VALUES (${sourceId}, 'Cover papers', 'rss', 'T1', 'editorial', '2100-01-01')`;
+  const otherSourceId = `cover-papers-other-${T}`;
+  await sql`INSERT INTO sources (id, name, kind, tier, participation_mode, next_fetch_at) VALUES
+    (${sourceId}, 'Cover papers', 'rss', 'T1', 'editorial', '2100-01-01'),
+    (${otherSourceId}, 'Other source on shared host', 'rss', 'T1', 'editorial', '2100-01-01')`;
   await upsertMaterial({ sourceId, url: `${papers.url}/abs/2610.2`, title: "Another paper", bodyStatus: "pending", via: "fetch" });
-  assert.equal(await at(papers.url, "/abs/2610.1", "/static/browse/0.3.4/images/logo-fb.png"), null, "the picture another article of the site declares too");
+  assert.equal(await articleCover(cover(papers.url, "/static/browse/0.3.4/images/logo-fb.png"), `${papers.url}/abs/2610.1`, `${papers.url}/abs/2610.1`, sourceId), null, "the picture another article of the same source declares too");
+  assert.deepEqual(await articleCover(cover(papers.url, "/static/browse/0.3.4/images/logo-fb.png"), `${papers.url}/abs/2610.1`, `${papers.url}/abs/2610.1`, otherSourceId), cover(papers.url, "/static/browse/0.3.4/images/logo-fb.png"), "another source sharing a host is not conflated");
   assert.deepEqual(await at(papers.url, "/abs/2610.3", "/images/figure-1.png"), cover(papers.url, "/images/figure-1.png"));
 });
 
@@ -193,7 +198,15 @@ test("the page, Markdown and full RSS show the cover above a body without pictur
   const page = await loadItemDetail(plain, "original", now);
   assert.equal(page.kind, "found");
   const html = page.kind === "found" ? page.item.body?.original ?? "" : "";
-  assert.match(html, /^<figure>.*?<img src="\/api\/img-proxy\?u=https%3A%2F%2Fcdn\.publisher\.example%2Fcover\.jpg&amp;[^"]*"[^>]*alt="A lab bench"[^>]*><\/picture><\/figure><p>The model/, "the page shows the cover first");
+  const fragment = load(html, null, false);
+  const first = fragment.root().children().first();
+  assert.ok(first.is("figure") && first.next().is("p"), "the page shows the cover before the text");
+  const image = first.find("img");
+  assert.equal(image.attr("alt"), cover.alt);
+  const source = new URL(image.attr("src")!, "https://reader.example");
+  assert.equal(source.pathname, "/api/img-proxy");
+  assert.equal(source.searchParams.get("u"), cover.url);
+  assert.equal(source.searchParams.get("mode"), "reading");
   assert.match((await exportMarkdown(plain))!.body, /!\[A lab bench\]\(https:\/\/cdn\.publisher\.example\/cover\.jpg\)/);
   const feed = await itemFeed("selected-full", null, { now });
   const item = (id: string) => feed.split("<item>").find((x) => x.includes(`<guid isPermaLink="false">${id}</guid>`)) ?? "";

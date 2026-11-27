@@ -1,12 +1,13 @@
 // The back office's shell for the modules' admin pages (ModulePage.admin): its own sidebar, listing those pages by
 // their nav names, instead of the site's. Only the admins a site module names get past its loader; everyone else
 // gets the site's 404. The engine's own admin pages keep their layout (layout.tsx).
-import { data, Link, NavLink, Outlet, useNavigation } from "react-router";
+import { data, Outlet, useNavigation } from "react-router";
 import { SITE } from "@aihot/site";
 import { RingMark } from "@aihot/site/brand/Logo.tsx";
 import { MODULES } from "@aihot/site/modules";
 import { NavigationProgress } from "../../components/shell/Chrome";
 import { adminPageAccess, GRAY_HEADERS } from "../../lib/admin.server";
+import { Link, NavLink } from "../../lib/link";
 
 /** The sidebar: every admin page without parameters in its address, in the order the site lists its modules. */
 const NAV = MODULES.flatMap((m) => (m.pages ?? []).flatMap((p) => ("layout" in p || !p.admin || p.path.includes(":") ? [] : [{ to: `/admin/${p.path}`, label: p.nav ?? p.path }])));
@@ -25,7 +26,7 @@ export default function ModuleAdminLayout({ loaderData }: { loaderData: { name: 
   const brand = (
     <span className="flex items-center gap-2">
       <RingMark className="size-6 text-accent" />
-      <span className="text-[15px] font-semibold tracking-tight text-ink">{`${SITE.name} 后台`}</span>
+      <span className="text-ui-body font-semibold tracking-tight text-ink">{`${SITE.name} 后台`}</span>
     </span>
   );
   const back = `回到 ${SITE.name}`;
@@ -37,12 +38,12 @@ export default function ModuleAdminLayout({ loaderData }: { loaderData: { name: 
         <nav className="scrollbar-thin flex-1 space-y-0.5 overflow-y-auto">
           {NAV.map((i) => (
             <NavLink key={i.to} to={i.to}
-              className={({ isActive }) => `block rounded-control px-3 py-[7px] text-[13.5px] transition-colors ${isActive ? "bg-surface font-medium text-ink shadow-sm ring-1 ring-line" : "text-ink-3 hover:text-ink"}`}>
+              className={({ isActive }) => `block rounded-control px-3 py-[7px] text-ui-label-lg transition-colors ${isActive ? "bg-surface font-medium text-ink shadow-sm ring-1 ring-line" : "text-ink-3 hover:text-ink"}`}>
               {i.label}
             </NavLink>
           ))}
         </nav>
-        <div className="mt-3 border-t border-line px-2 pt-3 text-[12.5px]">
+        <div className="mt-3 border-t border-line px-2 pt-3 text-ui-caption-lg">
           <div className="truncate text-ink-3">{loaderData.name}</div>
           <Link to="/" className="mt-1.5 inline-block text-ink-4 transition-colors hover:text-ink-2">{back}</Link>
         </div>
@@ -51,13 +52,13 @@ export default function ModuleAdminLayout({ loaderData }: { loaderData: { name: 
         <div className="sticky top-0 z-40 border-b border-line bg-bg/85 backdrop-blur lg:hidden">
           <div className="flex items-center gap-2 pl-4 pr-2">
             {brand}
-            <Link to="/" className="ml-auto inline-flex min-h-11 items-center px-2 text-[13px] text-ink-3">{back}</Link>
+            <Link to="/" className="ml-auto inline-flex min-h-11 items-center px-2 text-ui-label text-ink-3">{back}</Link>
           </div>
           {NAV.length > 1 && (
             <nav className="scrollbar-none flex gap-1 overflow-x-auto px-3 pb-2">
               {NAV.map((i) => (
                 <NavLink key={i.to} to={i.to}
-                  className={({ isActive }) => `inline-flex min-h-9 shrink-0 items-center whitespace-nowrap rounded-full px-3 text-[13px] ${isActive ? "bg-ink text-bg" : "text-ink-3"}`}>
+                  className={({ isActive }) => `inline-flex min-h-9 shrink-0 items-center whitespace-nowrap rounded-full px-3 text-ui-label ${isActive ? "bg-ink text-bg" : "text-ink-3"}`}>
                   {i.label}
                 </NavLink>
               ))}

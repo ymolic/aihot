@@ -1,8 +1,7 @@
 import {
-  isRouteErrorResponse, Link, Links, Meta, Outlet, Scripts, ScrollRestoration, useLoaderData, useLocation, useNavigation, useRouteError, useRouteLoaderData,
-  type ShouldRevalidateFunction,
+  isRouteErrorResponse, Links, Meta, Outlet, Scripts, ScrollRestoration, useLoaderData, useLocation, useNavigation, useRevalidator, useRouteError, useRouteLoaderData, type ShouldRevalidateFunction,
 } from "react-router";
-import type { SiteMeta } from "@aihot/contracts/site";
+import { latestVersion } from "../../../site/changelog.json";
 import { SITE } from "@aihot/site";
 import { RingMark } from "@aihot/site/brand/Logo.tsx";
 import { useEffect, useState, type ReactNode } from "react";
@@ -12,35 +11,33 @@ import { Sidebar } from "./components/shell/Sidebar";
 import { TabBar } from "./components/shell/TabBar";
 import { PullToRefresh } from "./components/shell/PullToRefresh";
 import { usePageTransition } from "./components/shell/transitions";
+import { useDisclosureMotion } from "./lib/disclosure";
 import { SearchOverlay } from "./features/search/SearchOverlay";
-import { BackToTop, NavigationProgress } from "./components/shell/Chrome";
+import { BackToTop, NavigationProgress, refreshAsked } from "./components/shell/Chrome";
+import { EnglishHint } from "./components/shell/EnglishHint";
 import { buttonClass } from "./components/ui/Controls";
 import { rememberPage, APPEARANCE_BOOT_SCRIPT, useAppearanceSync } from "./lib/local-state";
-import { apiGet } from "./lib/api.server";
+import { documentRead } from "./lib/api.server";
 import { useHydratedFlag } from "./lib/hydration";
 import { titled } from "./lib/seo";
 import { webModules } from "./site-modules";
+import { Link } from "./lib/link";
+import { feedPath, localeOf, translator, useLocale, useT } from "./lib/i18n";
 
 export const links: Route.LinksFunction = () => [
   { rel: "icon", href: "/favicon.ico", sizes: "any" },
   { rel: "icon", type: "image/png", href: "/icon.png" },
   { rel: "apple-touch-icon", href: "/apple-icon.png" },
   { rel: "manifest", href: "/manifest.webmanifest" },
-  { rel: "alternate", type: "application/rss+xml", title: `${SITE.name} — 精选`, href: "/feed.xml" },
 ];
 
 /** The release rendering this document: once a newer one is deployed, a render error reloads the page (entry.client). */
-export async function loader({ request }: Route.LoaderArgs) {
-  const release = process.env.AIHOT_RELEASE ?? null;
-  try {
-    const meta = await apiGet<SiteMeta>("/api/site/meta", {
-      headers: Object.assign({}, ...webModules().map((m) => m.root?.documentHeaders?.(request) ?? {})),
-      signal: request.signal,
-    });
-    return { ...meta, release };
-  } catch {
-    return { changelogVersion: null, release };
+export function loader({ request, context }: Route.LoaderArgs) {
+  for (const m of webModules()) {
+    const headers = m.root?.documentHeaders?.(request);
+    if (headers) context.set(documentRead, { ...context.get(documentRead), ...headers });
   }
+  return { changelogVersion: latestVersion, release: process.env.AIHOT_RELEASE ?? null };
 }
 
 export const shouldRevalidate: ShouldRevalidateFunction = () => false;
@@ -48,8 +45,10 @@ export const shouldRevalidate: ShouldRevalidateFunction = () => false;
 export function Layout({ children }: { children: React.ReactNode }) {
   const site = useRouteLoaderData<typeof loader>("root");
   const [documentRelease] = useState(site?.release ?? null);
+  const locale = useLocale();
+  const t = useT();
   return (
-    <html lang={SITE.locale} suppressHydrationWarning>
+    <html lang={locale === "en" ? "en" : SITE.locale} suppressHydrationWarning>
       <head>
         <meta charSet="utf-8" />
         {documentRelease && <meta name="aihot-release" content={documentRelease} />}
@@ -61,6 +60,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         {webModules().map((m) => m.root?.bootScript && <script key={m.name} dangerouslySetInnerHTML={{ __html: m.root.bootScript }} />)}
         <Meta />
         <Links />
+        <link rel="alternate" type="application/rss+xml" title={t(`${SITE.name} — 精选`, `${SITE.name} — Top Picks`)} href={feedPath("/feed.xml", locale)} />
       </head>
       <body>
         {children}
@@ -72,15 +72,19 @@ export function Layout({ children }: { children: React.ReactNode }) {
 }
 
 /** Only a page nobody matched falls back to this; every page names itself. */
-export function meta({ error }: Route.MetaArgs) {
+export function meta({ error, location }: Route.MetaArgs) {
   if (!error) return [];
+  const t = translator(localeOf(location.pathname));
   const notFound = isRouteErrorResponse(error) && error.status === 404;
-  return [{ title: titled(notFound ? "页面不存在" : "暂时无法加载") }, { name: "robots", content: "noindex" }];
+  return [{ title: titled(notFound ? t("页面不存在", "Page not found") : t("暂时无法加载", "Can't load this page")) }, { name: "robots", content: "noindex" }];
 }
 
 /** Sidebar, main column and phone tab bar around a page (or an error). */
 function SiteShell({ changelogVersion, children }: { changelogVersion: string | null; children: ReactNode }) {
   const navigation = useNavigation();
+  const revalidator = useRevalidator();
+  const asked = revalidator.state === "loading" && refreshAsked.current;
+  const t = useT();
   // The phone search and pull-to-refresh are client-side, mounted once the page is interactive.
   const [interactive, setInteractive] = useState(false);
   useEffect(() => setInteractive(true), []);
@@ -88,9 +92,9 @@ function SiteShell({ changelogVersion, children }: { changelogVersion: string | 
     // The desktop shell also opens on large phones held sideways, where the notch takes a side: the whole
     // shell keeps clear of it (the phone shell does so through its gutters).
     <div className="flex min-h-dvh lg:pl-[env(safe-area-inset-left)] lg:pr-[env(safe-area-inset-right)]">
-      <NavigationProgress active={navigation.state === "loading"} />
+      <NavigationProgress active={navigation.state === "loading" || asked} immediate={asked} />
       <a href="#main" className="sr-only focus:not-sr-only focus:fixed focus:left-3 focus:top-3 focus:z-[70] focus:rounded-control focus:bg-surface focus:px-3 focus:py-2">
-        跳到正文
+        {t("跳到正文", "Skip to content")}
       </a>
       <Sidebar changelogVersion={changelogVersion} />
       {/* Phone shell (≤ 699px): each page's top bar (PhoneBar), one centred column, the tab bar below.
@@ -105,6 +109,7 @@ function SiteShell({ changelogVersion, children }: { changelogVersion: string | 
       {interactive && <SearchOverlay />}
       {interactive && <PullToRefresh />}
       <BackToTop />
+      <EnglishHint />
     </div>
   );
 }
@@ -116,6 +121,7 @@ export default function App() {
   const { pathname, search } = useLocation();
   useEffect(() => rememberPage(pathname + search), [pathname, search]);
   usePageTransition();
+  useDisclosureMotion();
   // iOS Safari only shows :active (pressed) styles once the document listens for touches.
   useEffect(() => {
     const noop = () => {};
@@ -139,26 +145,29 @@ export function ErrorBoundary() {
   const error = useRouteError();
   const site = useRouteLoaderData<typeof loader>("root");
   const { pathname, search, hash } = useLocation();
+  const t = useT();
   const status = isRouteErrorResponse(error) ? error.status : 500;
   const notFound = status === 404;
   const body = (
     <div className="flex min-h-[70vh] items-center justify-center px-2 py-16">
       <div className="max-w-sm text-center">
         <RingMark className="mx-auto mb-5 size-10 text-accent" />
-        <div className="mono text-[12px] text-ink-4">{status}</div>
-        <h1 className="mt-1.5 text-[20px] font-bold text-ink">{notFound ? "找不到这个页面" : "暂时无法加载"}</h1>
-        <p className="mt-2 text-[13.5px] leading-relaxed text-ink-3">
-          {notFound ? "链接可能有误，或者这条内容已经下架。" : "页面暂时无法显示，请重新加载后再试。"}
+        <div className="mono text-ui-caption text-ink-4">{status}</div>
+        <h1 className="mt-1.5 text-ui-heading font-bold text-ink">{notFound ? t("找不到这个页面", "Page not found") : t("暂时无法加载", "Can't load this page")}</h1>
+        <p className="mt-2 text-ui-label-lg leading-relaxed text-ink-3">
+          {notFound
+            ? t("链接可能有误，或者这条内容已经下架。", "The link may be wrong, or this page has been taken down.")
+            : t("页面暂时无法显示，请重新加载后再试。", "Something went wrong while loading this page. Reload and try again.")}
         </p>
         <div className="mt-6 flex flex-wrap justify-center gap-2.5">
           {!notFound && <Link reloadDocument to={pathname + search + hash} className={buttonClass("primary")}>
-            重新加载
+            {t("重新加载", "Reload")}
           </Link>}
           <Link reloadDocument to="/" className={buttonClass(notFound ? "primary" : "secondary")}>
-            回到精选
+            {t("回到精选", "Back to Top Picks")}
           </Link>
           <Link reloadDocument to="/all" className={buttonClass("secondary")}>
-            浏览全部动态
+            {t("浏览全部动态", "Browse all news")}
           </Link>
         </div>
       </div>

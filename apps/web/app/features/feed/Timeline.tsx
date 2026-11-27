@@ -9,16 +9,22 @@ import { ToggleChip } from "../../components/ui/Controls";
 import type { TimelineCard, TimelineFilters, TimelineResponse } from "@aihot/contracts/site";
 import { FeedItem } from "./FeedItem";
 import { IconChevronDown } from "../../components/icons";
+import { SITE } from "@aihot/site";
 import { RingMark } from "@aihot/site/brand/Logo.tsx";
 import { EmptyState } from "../../components/ui/Page";
-import { beijingDate, beijingTime, beijingWeekday, monthDay } from "@aihot/contracts/time";
-import { byBeijingDay, weekdayShort } from "../../lib/format";
+import { beijingDate, beijingTime, monthDay, monthDayEn } from "@aihot/contracts/time";
+import { byBeijingDay, weekdayLong, weekdayShort } from "../../lib/format";
+import { apiIn, useLocale, useT } from "../../lib/i18n";
 import { isHydrated } from "../../lib/hydration";
-import { markRead, setUnreadOnly, useReadSet, useUnreadOnly } from "../../lib/local-state";
+import { MOTION } from "../../lib/motion";
+import { getReadIds, markRead, setUnreadOnly, useReadSet, useUnreadOnly } from "../../lib/local-state";
 import { filterParams, listPath } from "../../lib/seo";
 import { isReload, readSnapshot, restoreAnchor, saveSnapshot, useSaveOnLeave } from "../../lib/restore";
 
 const AUTO_BATCHES = 3;
+// A loaded page's cards rise in one after another, this far apart, the later ones together.
+const STAGGER_MS = 30;
+const STAGGER_MAX = 8;
 
 interface ListState {
   version: 2;
@@ -28,6 +34,9 @@ interface ListState {
   collapsed: string[];
   batches: number;
 }
+
+/** What this browser has read, now. */
+const readNow = () => new Set(getReadIds());
 
 function fromResponse(r: TimelineResponse): ListState {
   return { version: 2, cards: r.cards, nextCursor: r.nextCursor, dayCounts: r.dayCounts, collapsed: [], batches: 1 };
@@ -39,22 +48,22 @@ function fromResponse(r: TimelineResponse): ListState {
  * whole bar is the fold button).
  */
 export function DayHeader({ day, today, count, collapsed, onToggle, aside, asideOnPhone = true }: { day: string; today: string; count: number | null; collapsed?: boolean; onToggle?: () => void; aside?: React.ReactNode; asideOnPhone?: boolean }) {
-  const date = monthDay(day, today);
-  const weekday = beijingWeekday(day);
-  const short = weekdayShort(day);
+  const t = useT();
+  const locale = useLocale();
+  const date = t(monthDay(day, today), monthDayEn(day, today));
+  const weekday = weekdayLong(day, locale);
+  const short = weekdayShort(day, locale);
+  const items = (n: number) => t(<><span className="num">{n}</span> 条</>, <><span className="num">{n.toLocaleString("en-US")}</span> {n === 1 ? "item" : "items"}</>);
+  const fold = collapsed ? t(`展开${date}`, `Expand ${date}`) : t(`收起${date}`, `Collapse ${date}`);
   const phoneRow = (
     <>
-      <span className="text-[14px] font-bold text-ink">{day === today ? "今天" : date}</span>
-      {day === today && <span className="text-[12.5px] text-ink-4">{date}</span>}
-      <span className="text-[12.5px] text-ink-4">{short}</span>
-      <span className="ml-auto flex items-center gap-1 text-[12.5px] text-ink-4">
+      <span className="text-ui-body-sm font-bold text-ink">{day === today ? t("今天", "Today") : date}</span>
+      {day === today && <span className="text-ui-caption-lg text-ink-4">{date}</span>}
+      <span className="text-ui-caption-lg text-ink-4">{short}</span>
+      <span className="ml-auto flex items-center gap-1 text-ui-caption-lg text-ink-4">
         {asideOnPhone && aside}
-        {count !== null && (
-          <span>
-            <span className="num">{count}</span> 条
-          </span>
-        )}
-        {onToggle && <IconChevronDown size={15} className={`transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`} />}
+        {count !== null && <span>{items(count)}</span>}
+        {onToggle && <IconChevronDown size={15} className={`turn ${collapsed ? "-rotate-90" : ""}`} />}
       </span>
     </>
   );
@@ -62,7 +71,7 @@ export function DayHeader({ day, today, count, collapsed, onToggle, aside, aside
     <div className="bleed sticky top-[var(--bar-h)] z-20 bg-daybar lg:mx-0 lg:bg-bg lg:px-0">
       {/* Phones: a full-width day bar; on the timeline the whole bar folds the day. */}
       {onToggle ? (
-        <button type="button" onClick={onToggle} aria-expanded={!collapsed} aria-label={`${collapsed ? "展开" : "收起"}${date}`} className="flex h-11 w-full items-center gap-2 text-left lg:hidden">
+        <button type="button" onClick={onToggle} aria-expanded={!collapsed} aria-label={fold} className="flex h-11 w-full items-center gap-2 text-left lg:hidden">
           {phoneRow}
         </button>
       ) : (
@@ -71,33 +80,33 @@ export function DayHeader({ day, today, count, collapsed, onToggle, aside, aside
       {/* Desktop: date text shares the page's left edge, regardless of how many digits it has. */}
       <div className="hidden h-11 items-center gap-3 lg:flex">
         {onToggle ? (
-          <button type="button" onClick={onToggle} aria-expanded={!collapsed} className="whitespace-nowrap text-left text-[18px] font-semibold leading-6 text-ink">
+          <button type="button" onClick={onToggle} aria-expanded={!collapsed} className="whitespace-nowrap text-left text-ui-heading-sm font-semibold leading-6 text-ink">
             {date}
           </button>
         ) : (
-          <time dateTime={day} className="whitespace-nowrap text-[18px] font-semibold leading-6 text-ink">{date}</time>
+          <time dateTime={day} className="whitespace-nowrap text-ui-heading-sm font-semibold leading-6 text-ink">{date}</time>
         )}
         {onToggle ? (
           <button
             type="button"
             onClick={onToggle}
             aria-expanded={!collapsed}
-            aria-label={collapsed ? `展开${date}` : `收起${date}`}
-            className="grid size-6 place-items-center justify-self-center rounded-full text-ink-4 transition-colors hover:bg-bg-sunk hover:text-ink"
+            aria-label={fold}
+            className="grid size-6 place-items-center justify-self-center rounded-full text-ink-4 transition-colors hover:bg-bg-sunk hover:text-ink touch:size-11"
           >
-            <IconChevronDown size={14} className={`transition-transform duration-200 ${collapsed ? "-rotate-90" : ""}`} />
+            <IconChevronDown size={14} className={`turn ${collapsed ? "-rotate-90" : ""}`} />
           </button>
         ) : null}
-        <span className="text-[13px] text-ink-4">
+        <span className="text-ui-label text-ink-4">
           {weekday}
           {count !== null && (
             <>
               {" · "}
-              <span className="num">{count}</span> 条
+              {items(count)}
             </>
           )}
         </span>
-        {aside && <span className="ml-auto text-[12px] text-ink-4">{aside}</span>}
+        {aside && <span className="ml-auto text-ui-caption text-ink-4">{aside}</span>}
       </div>
     </div>
   );
@@ -116,12 +125,12 @@ export function TimelineSlot({ at, children, fresh = false, delay = 0, dataKey }
     >
       {/* Phones: the row without the rail (the item shows its time); a hairline between rows. */}
       <div className="grid grid-cols-[minmax(0,1fr)] border-b border-line-soft py-3.5 group-last/slot:border-b-0 lg:grid-cols-[64px_22px_minmax(0,1fr)] lg:border-b-0 lg:py-0 lg:pb-3 lg:group-last/slot:pb-0">
-        <time dateTime={at} className="mono hidden text-ink-3 lg:block lg:pt-[17px] lg:text-[12.5px] lg:font-semibold lg:leading-6">
+        <time dateTime={at} className="mono hidden text-ink-3 lg:block lg:pt-[17px] lg:text-ui-caption-lg lg:font-semibold lg:leading-6">
           {beijingTime(at)}
         </time>
         <span aria-hidden="true" className="relative hidden lg:block">
           <span className="absolute -bottom-[41px] left-[10.5px] top-[29px] w-px bg-line-strong group-last/slot:hidden" />
-          <span className="absolute left-[7.5px] top-[25.5px] size-[7px] rounded-full bg-accent shadow-[0_0_0_4px_var(--bg)] transition-transform duration-300 group-hover/slot:scale-[1.15]" />
+          <span className="absolute left-[7.5px] top-[25.5px] size-[7px] rounded-full bg-accent shadow-[0_0_0_4px_var(--bg)] transition-transform group-hover/slot:scale-[1.15]" />
         </span>
         {children}
       </div>
@@ -130,6 +139,8 @@ export function TimelineSlot({ at, children, fresh = false, delay = 0, dataKey }
 }
 
 export function Timeline({ initial, filters }: { initial: TimelineResponse; filters: TimelineFilters }) {
+  const t = useT();
+  const api = apiIn("/timeline", useLocale());
   const location = useLocation();
   const navigation = useNavigation();
   const readSet = useReadSet();
@@ -146,16 +157,20 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
     return fromResponse(initial);
   });
   const restoredRef = useRef(false);
+  // 只看未读: what had been read when this visit began (see unreadVisible below).
+  const [readBefore, setReadBefore] = useState<Set<string> | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [freshKeys, setFreshKeys] = useState<Set<string>>(() => new Set());
+  const freshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(freshTimer.current), []);
   const stateRef = useRef(state);
   stateRef.current = state;
 
   // Filters (i.e. the loader data) changed. A page still loading for the old filters is cancelled, and a
   // response that arrives anyway is dropped (it belongs to another list and cursor). Back or forward to a
   // filter already visited restores what that history entry had loaded and folded; a new one starts over.
-  const filterKey = listPath("/api/site/timeline", filterParams(filters));
+  const filterKey = listPath(api, filterParams(filters));
   const lastFilterKey = useRef(filterKey);
   const pageRequest = useRef<AbortController | null>(null);
   useEffect(() => () => pageRequest.current?.abort(), []);
@@ -173,6 +188,7 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
       } else {
         setState(fromResponse(initial));
       }
+      setReadBefore(readNow());
     }
   }, [filterKey, initial, historyKey]);
 
@@ -188,6 +204,7 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
     setLoadingMore(false);
     setLoadError(false);
     setState(fromResponse(initial));
+    setReadBefore(readNow());
   }, [initial, filterKey]);
 
   useLayoutEffect(() => {
@@ -217,14 +234,14 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
   const loadMore = useCallback(async () => {
     const s = stateRef.current;
     if (!s.nextCursor || pageRequest.current) return;
-    const key = listPath("/api/site/timeline", filterParams(filters));
+    const key = listPath(api, filterParams(filters));
     const controller = new AbortController();
     pageRequest.current = controller;
     const current = () => lastFilterKey.current === key && !controller.signal.aborted;
     setLoadingMore(true);
     setLoadError(false);
     try {
-      const res = await fetch(listPath("/api/site/timeline", { ...filterParams(filters), cursor: s.nextCursor }), { signal: controller.signal });
+      const res = await fetch(listPath(api, { ...filterParams(filters), cursor: s.nextCursor }), { signal: controller.signal });
       if (res.status === 400) {
         // Cursor no longer fits: start over from the head.
         const head = await fetch(key, { signal: controller.signal });
@@ -239,6 +256,9 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
         const seen = new Set(prev.cards.map((c) => c.key));
         const added = page.cards.filter((c) => !seen.has(c.key));
         setFreshKeys(new Set(added.map((c) => c.key)));
+        // They arrive once: a day folded and opened again, or the unread filter toggled, shows them without replaying it.
+        clearTimeout(freshTimer.current);
+        freshTimer.current = setTimeout(() => setFreshKeys(new Set()), STAGGER_MS * STAGGER_MAX + MOTION.move + 100);
         return {
           ...prev,
           cards: [...prev.cards, ...added],
@@ -273,10 +293,16 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
   // 只看未读 hides cards read in this browser: an ordinary card by its own id, a reading group by any
   // of its selected reports, so a read representative does not hide the unread reports behind it.
   // A group kept that way is not drawn as read; its expansion marks which reports are unread.
+  // What it hides is what had been read when the list opened (or was refreshed, or the filter turned on): a card
+  // read on this visit stays where it is, drawn as read, so opening one (in this tab or a new one) does not pull
+  // the list from under the reader. Coming back to the list is a new visit: the report just read is gone.
+  useEffect(() => setReadBefore(readNow()), []);
+  const hidden = readBefore ?? readSet;
   const unreadVisible = useCallback(
-    (card: TimelineCard) => !readSet.has(card.item.id) || (card.group?.memberIds?.some((id) => !readSet.has(id)) ?? false),
-    [readSet],
+    (card: TimelineCard) => !hidden.has(card.item.id) || (card.group?.memberIds?.some((id) => !hidden.has(id)) ?? false),
+    [hidden],
   );
+  const unreadMember = (card: TimelineCard) => card.group?.memberIds?.some((id) => !readSet.has(id)) ?? false;
   const days = useMemo(
     () => byBeijingDay(unreadOnly ? state.cards.filter(unreadVisible) : state.cards, (c) => c.anchorAt),
     [state.cards, unreadOnly, unreadVisible],
@@ -292,17 +318,51 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
     void loadMore();
   }, [unreadOnly, visibleCount, loadingMore, loadError, state.nextCursor, state.batches, loadMore]);
 
-  const toggleDay = (day: string) =>
+  // With 只看未读 on and cards on show, one press of 加载更多 keeps loading until something unread shows up or the
+  // list ends (a few pages at most), so a press over pages that were all read is never answered by nothing. With
+  // none on show, the list says the pages were all read and each press loads one more.
+  const chase = useRef<{ from: number; left: number } | null>(null);
+  const pressMore = () => {
+    chase.current = unreadOnly && visibleCount > 0 ? { from: visibleCount, left: 4 } : null;
+    void loadMore();
+  };
+  useEffect(() => {
+    const c = chase.current;
+    if (!c || loadingMore) return;
+    if (loadError || !state.nextCursor || visibleCount > c.from || c.left <= 0) {
+      chase.current = null;
+      return;
+    }
+    c.left -= 1;
+    void loadMore();
+  }, [visibleCount, loadingMore, loadError, state.nextCursor, loadMore]);
+
+  const toggleDay = (day: string) => {
+    // Folded from inside (its date bar stuck at the top), the day is first brought back to its start, so the bar
+    // stays where the reader pressed it and the days after rise to meet it.
+    if (!stateRef.current.collapsed.includes(day)) {
+      const section = document.querySelector<HTMLElement>(`section[aria-label="${day}"]`);
+      const bar = section?.firstElementChild;
+      if (section && bar instanceof HTMLElement) {
+        const top = section.getBoundingClientRect().top;
+        const stuck = bar.getBoundingClientRect().top;
+        if (top < stuck - 1) window.scrollTo({ top: window.scrollY + top - stuck, behavior: "instant" });
+      }
+    }
     setState((s) => ({ ...s, collapsed: s.collapsed.includes(day) ? s.collapsed.filter((d) => d !== day) : [...s.collapsed, day] }));
+  };
 
   let order = 0;
   const unreadToggle = (
-    <ToggleChip on={unreadOnly} onToggle={() => setUnreadOnly(!unreadOnly)}>
-      只看未读
+    <ToggleChip on={unreadOnly} onToggle={() => { if (!unreadOnly) setReadBefore(readNow()); setUnreadOnly(!unreadOnly); }}>
+      {t("只看未读", "Unread only")}
     </ToggleChip>
   );
+  // Another category or tag on the way: the list it replaces dims until the new one is in, if it takes a moment
+  // (a switch that lands at once does not flash).
+  const switching = navigation.state === "loading" && !!navigation.location && navigation.location.pathname === location.pathname && navigation.location.search !== location.search;
   return (
-    <div className="relative">
+    <div className={`relative transition-opacity ${switching ? "opacity-55 delay-150" : ""}`}>
       {/* Desktop puts it on the first date row; phones, and a list the filter left empty, keep its own row. */}
       <div className={`mb-2 flex justify-end ${days.length ? "lg:hidden" : ""}`}>{unreadToggle}</div>
 
@@ -310,12 +370,16 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
         <div className="lg:card">
           {unreadOnly ? (
             state.nextCursor ? (
-              <EmptyState title="这批精选都读过了">点下方的按钮，继续找更早的未读精选。</EmptyState>
+              <EmptyState title={t("这批精选都读过了", "You've read all of these")}>
+                {loadError
+                  ? t("加载更早内容失败，点下方重试按钮继续查看。", "Couldn't load older picks. Try again below.")
+                  : t("点下方“加载更多”，继续看更早的未读精选。", "Use “Load more” below for older unread picks.")}
+              </EmptyState>
             ) : (
-              <EmptyState title="没有未读的精选内容">关掉「只看未读」可以看到全部内容。</EmptyState>
+              <EmptyState title={t("没有未读的精选内容", "No unread top picks")}>{t("关掉「只看未读」可以看到全部内容。", "Turn off “Unread only” to see everything.")}</EmptyState>
             )
           ) : (
-            <EmptyState title="这个筛选下还没有精选内容">换个类别看看，或者去全部动态里找找。</EmptyState>
+            <EmptyState title={t("这个筛选下还没有精选内容", "No top picks match this filter yet")}>{t("换个类别看看，或者去全部动态里找找。", `Try another category, or browse All ${SITE.subject} News.`)}</EmptyState>
           )}
         </div>
       )}
@@ -331,10 +395,10 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
                 <ol className="lg:pt-1">
                   {cards.map((c) => {
                     const fresh = freshKeys.has(c.key);
-                    const delay = fresh ? Math.min(order++, 10) * 40 : 0;
+                    const delay = fresh ? Math.min(order++, STAGGER_MAX) * STAGGER_MS : 0;
                     return (
                       <TimelineSlot key={c.key} dataKey={c.key} at={c.anchorAt} fresh={fresh} delay={delay}>
-                        <FeedItem item={c.item} group={c.group} filters={filters} read={readSet.has(c.item.id) && !(unreadOnly && unreadVisible(c))} onOpen={markRead} at={c.anchorAt} />
+                        <FeedItem item={c.item} group={c.group} filters={filters} read={readSet.has(c.item.id) && !(unreadOnly && unreadMember(c))} onOpen={markRead} at={c.anchorAt} />
                       </TimelineSlot>
                     );
                   })}
@@ -345,31 +409,33 @@ export function Timeline({ initial, filters }: { initial: TimelineResponse; filt
       })}
 
       <div ref={sentinel} aria-hidden="true" />
-      <FeedEnd loading={loadingMore} error={loadError} hasMore={!!state.nextCursor} manual={state.batches >= AUTO_BATCHES} empty={visibleCount === 0} onMore={loadMore} />
+      <FeedEnd loading={loadingMore} error={loadError} hasMore={!!state.nextCursor} manual={state.batches >= AUTO_BATCHES} empty={visibleCount === 0} onMore={pressMore} />
     </div>
   );
 }
 
 /** The foot of a paged list: loading, retry, "加载更多" after a few automatic pages, or the end. */
 function FeedEnd({ loading, error, hasMore, manual, empty, onMore }: { loading: boolean; error: boolean; hasMore: boolean; manual: boolean; empty: boolean; onMore: () => void }) {
+  const t = useT();
   return (
-    <div className="flex justify-center py-6">
+    // One height for every state, so the page does not move as the foot turns from loading to the button or the end.
+    <div className="flex min-h-[84px] items-center justify-center">
       {loading ? (
-        <span className="inline-flex items-center gap-2 text-[12.5px] text-ink-4">
-          <RingMark className="size-4 text-accent" spinning /> 正在加载
+        <span className="anim-fade-in inline-flex items-center gap-2 text-ui-caption-lg text-ink-4">
+          <RingMark className="size-4 text-accent" spinning /> {t("加载中…", "Loading…")}
         </span>
       ) : error ? (
-        <button type="button" onClick={onMore} className="h-9 rounded-full border border-hot/30 px-4 text-[13px] text-hot hover:bg-hot-soft">
-          加载失败，点此重试
+        <button type="button" onClick={onMore} className="anim-fade-in press h-11 rounded-full border border-hot/30 px-4 text-ui-label text-hot hover:bg-hot-soft lg:h-9 touch:h-11">
+          {t("加载失败，重试", "Couldn't load. Retry")}
         </button>
       ) : hasMore ? (
         manual && (
-          <button type="button" onClick={onMore} className="h-9 rounded-full border border-line-strong bg-surface px-5 text-[13px] font-medium text-ink-2 transition-colors hover:border-ink-4 hover:text-ink">
-            加载更多
+          <button type="button" onClick={onMore} className="anim-fade-in press h-11 rounded-full border border-line-strong bg-surface px-5 text-ui-label font-medium text-ink-2 hover:border-ink-4 hover:text-ink lg:h-9 touch:h-11">
+            {t("加载更多", "Load more")}
           </button>
         )
       ) : (
-        !empty && <span className="text-[12px] text-ink-4">已经到底了</span>
+        !empty && <span className="text-ui-caption text-ink-4">{t("已经到底了", "That's everything")}</span>
       )}
     </div>
   );

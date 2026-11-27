@@ -4,6 +4,8 @@
 //   today — money at risk or only the owner can act: sent at once, repeated at most daily, recovery reported.
 //   later — other follow-ups: one 09:00 list a day for the agent (the owner's only without one). A source's follow-up is
 //           closed on its own: a fix removes it, and one judged not worth fixing is closed with a reason.
+// A problem that turns more urgent is told at once. One that comes and goes (Finding.settles) recovers only after
+// staying gone that long; back sooner, it is the same incident and nothing new is sent.
 // A finding with agentOnly is still now or today, but it only wakes the agent: nothing is sent when it
 // opens, nothing is sent when it clears, and it stays off the 09:00 digest.
 // With an agent taking the alerts (notify/agent.ts), a now or today problem that is not the owner's own
@@ -19,7 +21,7 @@ import { ALERTS, EDITION_TIMES } from "@aihot/site";
 import { audit } from "../audit.ts";
 import { sql } from "../db.ts";
 import { agentConfigured, agentTransportFindings, flushAgentEvents, handoffs, wakeAgent, wakeDigest } from "../notify/agent.ts";
-import { duration, formatAlert, formatRecovery, formatReturn, sendAlert, type Finding, type Level } from "../notify/feishu.ts";
+import { duration, formatAlert, formatRecovery, formatReturn, sendAlert, type Finding, type FollowUp, type Level } from "../notify/feishu.ts";
 import { stepsOnService } from "../editorial/models.ts";
 import { backupConfigured } from "./backup.ts";
 import { GROUPING_WARN_AFTER_MS, waitingSelectedNews } from "./grouping.ts";
@@ -37,6 +39,9 @@ const HANDED_MS: Record<Exclude<Level, "later">, number> = { now: 3600_000, toda
 /** The handoff that tells the owner a problem keeps coming back, counted over a day; told at most once a day. */
 const RETURNS = 3;
 const DAY_MS = 86_400_000;
+const LEVEL_RANK: Record<Level, number> = { later: 0, today: 1, now: 2 };
+/** An open problem told at one level that now needs a more urgent one (a provider's fault turning into the site's own). */
+const escalated = (open: AlertEntry, f: Finding) => !!open.level && LEVEL_RANK[f.level] > LEVEL_RANK[open.level];
 
 // Valves default off: read at call time, only an explicit "true" turns them on.
 const collecting = () => process.env.COLLECT_ENABLED === "true";
@@ -50,10 +55,11 @@ const QUIET_MINUTES = Math.min(Number(process.env.ALERT_QUIET_MINUTES || ALERTS.
 const QUIET_FETCHING_MINUTES = Math.min(Math.max(ALERTS.quietWhileFetchingMinutes, QUIET_MINUTES), 1440);
 
 /** One check: the problems it finds now. `open` retains ongoing incidents, read once per round. */
-type Check = (now: number, open: AlertState) => Promise<Finding[]>;
+type FindingWithCoverage = Finding & { coveredSourceFailures?: string[] };
+type Check = (now: number, open: AlertState) => Promise<FindingWithCoverage[]>;
 
-/** Everything checked every round, in the order the findings are listed. */
-const CHECKS: Check[] = [
+/** Checks that can open, downgrade or recover an incident during the ten-minute round. */
+const INCIDENT_CHECKS: Check[] = [
   // Readers affected now
   contentCollection,
   sourcesFailing,
@@ -66,21 +72,34 @@ const CHECKS: Check[] = [
   backupAge,
   upstreamFindings,
   moduleAlerts,
-  // Follow-ups
+  agentTransportFindings,
+];
+
+/** The full list also includes work only read by the digest and on-demand operations pages. */
+const ALL_CHECKS: Check[] = [
+  ...INCIDENT_CHECKS,
   sourceFollowUps,
   baiduPushFailing,
   unknownOutcomes,
-  agentTransportFindings,
   waitingQueues,
   moduleFollowUps,
 ];
 
 /** Everything wrong right now, with its level. */
 export async function collectFindings(now = Date.now(), open?: AlertState): Promise<Finding[]> {
+  return withoutCoveredFindings(await readFindings(now, open));
+}
+
+async function readFindings(now: number, open?: AlertState, checks = ALL_CHECKS): Promise<FindingWithCoverage[]> {
   const announced = open ?? await alertState();
-  const out: Finding[] = [];
-  for (const check of CHECKS) out.push(...(await check(now, announced)));
+  const out: FindingWithCoverage[] = [];
+  for (const check of checks) out.push(...(await check(now, announced)));
   return out;
+}
+
+function withoutCoveredFindings(findings: FindingWithCoverage[]): Finding[] {
+  const covered = new Set(findings.flatMap(finding => finding.coveredSourceFailures ?? []));
+  return findings.filter(finding => !covered.has(finding.key));
 }
 
 // Content flow, judged by outcome: whatever broke (worker, egress proxy, models, queues), readers see
@@ -120,32 +139,71 @@ async function contentCollection(now: number, open: AlertState): Promise<Finding
  * worker down meanwhile, so only a fetch that works again is recovery. Production, 30 days to 2026-10-28:
  * the egress proxy dropped on 10-05, 10-17 and 10-26 and 23–37% of the sources were failing at the worst;
  * at no other time more than 11.5%. Fewer than 50 failing sources are each one's own follow-up.
+ * A provider's own server error (`<service> HTTP 5xx:`, receipts.ts assertAccepted) proved the way out works:
+ * 2026-11-21 SocialData's search answered 500 for hours while every website fetched, and its X accounts alone
+ * were half the sources. Such an outage is told once and then daily. Apply the overall threshold to open the
+ * incident, then attribute it: when the other failures are below the minimum for a group alert, they stay
+ * individual follow-ups and a provider-sized group can explain the incident. On 2026-11-25, 138 SocialData
+ * errors and one unrelated timeout out of 922 sources otherwise looked like an outage of our own connection.
+ * A 4xx (a refused key, a used-up budget) stays in the non-provider count.
  */
 const FAILING_SHARE = 0.15;
 const FAILING_SOURCES = 50;
+/**
+ * A provider's outage comes and goes: 2026-11-21..26 SocialData's alert opened and recovered 15 times (37
+ * messages; on 11-24 twelve), the share of failing sources swinging around the threshold. Back within three
+ * hours it is the same outage; replayed on those six days the owner would have had about 10 messages.
+ */
+const PROVIDER_OUTAGE_SETTLES_MS = 3 * 3600_000;
+const PROVIDER_ANSWER = "^([a-z_]+) HTTP 5[0-9]{2}:";
 
-async function sourcesFailing(now: number, open: AlertState): Promise<Finding[]> {
+async function sourcesFailing(now: number, open: AlertState): Promise<FindingWithCoverage[]> {
   if (!collecting() && !open["content.fetch"]) return [];
-  const latest = sql`SELECT r.status, r.error, r.started_at FROM sources s CROSS JOIN LATERAL (
+  const latest = sql`SELECT s.id, r.status, r.error, r.started_at FROM sources s CROSS JOIN LATERAL (
       SELECT status, error, started_at FROM fetch_runs f
       WHERE f.source_id = s.id AND f.status IN ('ok', 'failed') AND f.started_at <= ${new Date(now)}
       ORDER BY started_at DESC LIMIT 1) r
     WHERE s.enabled`;
-  const [r] = await sql<{ fetched: number; failing: number }[]>`
-    SELECT count(*)::int AS fetched, count(*) FILTER (WHERE status = 'failed')::int AS failing FROM (${latest}) l`;
-  if (!r || r.failing < FAILING_SOURCES || r.failing < r.fetched * FAILING_SHARE) return [];
+  const [r] = await sql<{ fetched: number; failing: number; answered: string[] | null }[]>`
+    SELECT count(*)::int AS fetched, count(*) FILTER (WHERE status = 'failed')::int AS failing,
+      array_agg(id) FILTER (WHERE status = 'failed' AND error ~ ${PROVIDER_ANSWER}) AS answered FROM (${latest}) l`;
+  const many = (n: number) => n >= FAILING_SOURCES && n >= r!.fetched * FAILING_SHARE;
+  if (!r || !many(r.failing)) return [];
+  const answered = r.answered ?? [];
+  const otherFailures = r.failing - answered.length;
+  const providerOutage = many(answered.length) || (answered.length >= FAILING_SOURCES && otherFailures < FAILING_SOURCES);
   const errors = await sql<{ error: string; n: number; first: Date }[]>`
     SELECT left(coalesce(error, ''), 120) AS error, count(*)::int AS n, min(started_at) AS first FROM (${latest}) l
     WHERE status = 'failed' GROUP BY 1 ORDER BY 2 DESC`;
-  return [{
+  const detail = `失败信源占 ${Math.round((r.failing / r.fetched) * 100)}%（门槛 ${FAILING_SHARE * 100}% 且至少 ${FAILING_SOURCES} 个），其中服务商回了错误的 ${answered.length} 个；常见错误：${errors.slice(0, 3).map((e) => `${e.error || "（无）"} ×${e.n}`).join("；")}`;
+  const since = new Date(Math.min(...errors.map((e) => e.first.getTime())));
+  if (many(otherFailures) || !providerOutage) return [{
     key: "content.fetch",
     level: "now",
     title: "大量信源抓取失败，这些信源的新文章进不来",
     impact: `最近抓取过的 ${r.fetched} 个信源里，${r.failing} 个最近一次抓取失败，读者暂时看不到它们的新文章`,
     heals: "服务器连外网的线路恢复后会按排程重新抓取，这段时间的新文章会晚到；线路不恢复就一直进不来",
     action: "转给 AI 检查出网代理和抓取错误",
-    detail: `失败信源占 ${Math.round((r.failing / r.fetched) * 100)}%（门槛 ${FAILING_SHARE * 100}% 且至少 ${FAILING_SOURCES} 个）；常见错误：${errors.slice(0, 3).map((e) => `${e.error || "（无）"} ×${e.n}`).join("；")}`,
-    since: new Date(Math.min(...errors.map((e) => e.first.getTime()))),
+    detail,
+    since,
+  }];
+  const services = [...new Set(errors.map((e) => e.error.match(new RegExp(PROVIDER_ANSWER))?.[1]).filter((s): s is string => !!s))];
+  const names = services.map(providerName).join("、");
+  const stops = services.map((s) => provider(s)?.stops).filter(Boolean).join("，");
+  return [{
+    key: "content.fetch",
+    level: "today",
+    owner: "only",
+    title: `${names} 出故障，${stops || "经它抓取的信源进不来"}`,
+    impact: `最近抓取过的 ${r.fetched} 个信源里，${r.failing} 个最近一次抓取失败，其中 ${answered.length} 个是 ${names} 那边出错，读者暂时看不到它们的新内容`,
+    heals: `会，${names} 恢复后按排程重新抓取，这段时间的新内容会晚到`,
+    action: "不用处理，是对方的故障；恢复后会再发一条通知",
+    detail,
+    since,
+    settles: PROVIDER_OUTAGE_SETTLES_MS,
+    // The provider alert already covers these failures. Other errors and other problems on the same
+    // source still need their own follow-up (2026-11-23: 55 copies of a single SocialData outage).
+    coveredSourceFailures: answered.map(id => `sources.failing.${id}`),
   }];
 }
 
@@ -265,7 +323,7 @@ async function backupAge(now: number): Promise<Finding[]> {
  * verification does not heal, while Baidu answering "please retry later" for an hour does. Readers see
  * nothing; new pages reach Baidu later, so it is a follow-up.
  */
-async function baiduPushFailing(now: number): Promise<Finding[]> {
+async function baiduPushFailing(now: number): Promise<FollowUp[]> {
   const [r] = await sql<{ since: Date | null; error: string | null }[]>`
     WITH last_ok AS (SELECT max(started_at) AS at FROM job_runs WHERE job = 'seo.baidu-push' AND status = 'ok')
     SELECT min(f.started_at) AS since, (array_agg(f.error ORDER BY f.started_at DESC))[1] AS error
@@ -292,17 +350,17 @@ async function moduleAlerts(now: number): Promise<Finding[]> {
  * One follow-up per source and problem, so fixing a source removes its own line. A quiet source is left to
  * the weekly report: being slow, or too new to have a rhythm, is nothing anyone can fix, and may never end.
  */
-async function sourceFollowUps(now: number): Promise<Finding[]> {
+async function sourceFollowUps(now: number): Promise<FollowUp[]> {
   if (!collecting()) return [];
-  return (await sourceHealth(now)).flatMap(group => SOURCE_PROBLEMS.flatMap(p => group[p.problem].map((s): Finding => ({
+  return (await sourceHealth(now)).flatMap(group => SOURCE_PROBLEMS.flatMap(p => group[p.problem].map((s): FollowUp => ({
     key: `sources.${p.problem}.${s.id}`, level: "later", title: `${group.name}信源「${s.name}」${p.title}`,
     detail: `${s.id}：${p.describe(s)}；${p.action}`, observedAt: p.observedAt(s) ?? undefined,
   }))));
 }
 
 /** Paid requests and content-group pushes whose outcome is not known yet. */
-async function unknownOutcomes(): Promise<Finding[]> {
-  const out: Finding[] = [];
+async function unknownOutcomes(): Promise<FollowUp[]> {
+  const out: FollowUp[] = [];
 
   const [r] = await sql<{ receipts: number; services: string | null; deliveries: number; targets: string | null }[]>`
     SELECT (SELECT count(*)::int FROM receipts WHERE ${awaitingRelease()}) AS receipts,
@@ -317,17 +375,17 @@ async function unknownOutcomes(): Promise<Finding[]> {
 }
 
 /** Runnable jobs (deferred ones excluded) that have waited more than two hours. */
-async function waitingQueues(now: number): Promise<Finding[]> {
+async function waitingQueues(now: number): Promise<FollowUp[]> {
   const queues = await sql<{ name: string; n: number; oldest: Date }[]>`
     SELECT name, count(*)::int AS n, min(start_after) AS oldest FROM pgboss.job
     WHERE state IN ('created', 'retry') AND start_after <= now() AND name NOT LIKE 'cron.%' GROUP BY 1`;
-  return queues.filter((q) => now - q.oldest.getTime() > 2 * 3600_000).map((q): Finding => (
+  return queues.filter((q) => now - q.oldest.getTime() > 2 * 3600_000).map((q): FollowUp => (
     { key: `queue.${q.name}`, level: "later", title: `后台任务排队超过 2 小时：${q.name}`, detail: `${q.n} 个等待，最早的等了 ${duration(now - q.oldest.getTime())}` }));
 }
 
 /** The site's modules' follow-ups. */
-async function moduleFollowUps(now: number): Promise<Finding[]> {
-  const out: Finding[] = [];
+async function moduleFollowUps(now: number): Promise<FollowUp[]> {
+  const out: FollowUp[] = [];
   for (const m of serverModules()) if (m.followUps) out.push(...(await m.followUps(now)));
   return out;
 }
@@ -415,6 +473,11 @@ interface AlertEntry {
   title: string;
   since: string;
   sentAt?: string;
+  /** The level last told: a problem that turns more urgent is told at once (escalated). */
+  level?: Level;
+  /** Finding.settles of the latest finding, and the first round that no longer found it. */
+  settles?: number;
+  goneAt?: string;
   agentOnly?: true;
   privateOwner?: true;
   privateNotice?: PrivateNotice;
@@ -531,7 +594,7 @@ async function settleDailies(open: AlertState, found: Set<string>, now: number):
  */
 export async function checkAlerts(now = Date.now()) {
   const state = await alertState();
-  const all = await collectFindings(now, state);
+  const all = withoutCoveredFindings(await readFindings(now, state, INCIDENT_CHECKS));
   const handing = agentConfigured() && !all.some((f) => f.key === "webhook.transport");
   const returns = await returnsTold(now);
   const holds = await savedHolds();
@@ -582,7 +645,7 @@ export async function checkAlerts(now = Date.now()) {
         continue;
       }
     }
-    if (open?.sentAt && now - Date.parse(open.sentAt) <= REPEAT_MS[f.level]) continue;
+    if (open?.sentAt && now - Date.parse(open.sentAt) <= REPEAT_MS[f.level] && !escalated(open, f)) continue;
     const since = open ? new Date(open.since) : (f.since ?? new Date(now));
     // Claim AI was notified only after the hub actually accepts this incident's wake; persist the occurrence
     // timestamp first so a failed owner send or crash after waking cannot mint a second incident ID on retry.
@@ -608,8 +671,16 @@ export async function checkAlerts(now = Date.now()) {
       continue;
     }
     await sendAlert(msg.title, msg.lines);
-    state[f.key] = { ...entry, sentAt: new Date(now).toISOString() };
+    state[f.key] = { ...entry, sentAt: new Date(now).toISOString(), level: f.level };
     sent.push(f.key);
+  }
+  for (const f of all) {
+    const open = state[f.key];
+    if (!open) continue;
+    const { settles: _settles, goneAt: _goneAt, ...entry } = open;
+    // An incident told before levels were kept: from here on its level is the one found now.
+    if (entry.sentAt && !entry.level) entry.level = f.level;
+    state[f.key] = f.settles ? { ...entry, settles: f.settles } : entry;
   }
   const found = new Set(all.map((f) => f.key));
   const dailies = await settleDailies(state, found, now);
@@ -621,7 +692,14 @@ export async function checkAlerts(now = Date.now()) {
       delete state[key];
       continue;
     }
-    const msg = formatRecovery(open.title, new Date(open.since), now);
+    // Gone for less than its settling time, counted from the first round that no longer found it: it may
+    // come back as the same incident, so nothing is told yet.
+    const goneAt = open.settles ? Date.parse(open.goneAt ?? new Date(now).toISOString()) : null;
+    if (goneAt !== null && now - goneAt < open.settles!) {
+      state[key] = { ...open, goneAt: new Date(goneAt).toISOString() };
+      continue;
+    }
+    const msg = formatRecovery(open.title, new Date(open.since), goneAt ?? now);
     if (open.privateOwner) {
       await tellPrivate(key, open, msg, true);
       continue;
@@ -712,10 +790,12 @@ export async function restoreFollowUp(key: string, reason: string, actor: string
 /** 09:00: the open follow-ups, one list; nothing when there are none. Closures whose problem is gone lapse here.
  *  Agent-only handoffs stay on the ops list and are not part of the owner's message. */
 export async function sendDigest(now = Date.now()) {
-  const found = (await collectFindings(now)).filter((f) => f.level === "later");
-  const dismissed = await dismissedFollowUps(found, now);
+  const findings = await readFindings(now);
+  // A source's closure remains in effect while a provider alert temporarily covers its failure.
+  const dismissed = await dismissedFollowUps(findings, now);
   const lapsed = Object.keys(await savedDismissals()).filter((key) => !dismissed[key]);
   if (lapsed.length) await sql`UPDATE settings SET value = value - ${sql.array(lapsed)}::text[], updated_at = now() WHERE key = 'alerts.dismissed'`;
+  const found = withoutCoveredFindings(findings).filter((f) => f.level === "later");
   const items = found.filter((f) => !dismissed[f.key] && !f.agentOnly);
   const lines = items.map((f, i) => `${i + 1}. ${f.title}${f.detail ? `\n   ${f.detail}` : ""}`);
   // Once the hub has the list, the agent works through it alone and passes on what is still the owner's. Without

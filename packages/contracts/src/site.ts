@@ -2,9 +2,11 @@
 // but it is served from the same public read layer as v1, RSS and MCP.
 import type { MentionTarget } from "./mentions.ts";
 import type { CategoryKey, ChannelKey } from "./taxonomy.ts";
-import { isoWeekRange, monthDay } from "./time.ts";
+import { isoWeekRange, longDateEn, monthDay, monthDayEn } from "./time.ts";
 
 export interface SourceRef {
+  /** Stable canonical source id (`sources.id`); optional for legacy/unbacked citations. */
+  id?: string;
   /** The name readers see (publication/rules.ts publicSourceName), as is every source name here. */
   name: string;
 }
@@ -209,6 +211,7 @@ export interface GroupReportsResponse {
 export const HOT_FACE_LIMIT = 6;
 
 export interface HotParticipant {
+  sourceId?: string;
   name: string;
   kind: "editorial" | "signal";
   /** Only visible faces carry images: the source's icon or its latest collected X avatar (proxied). */
@@ -288,7 +291,7 @@ export interface StoryDetail {
   /** The story's own factual summary, when it has one. */
   summary: string | null;
   /** Without a digest or summary: the summary of the report the story started from. */
-  excerpt: { text: string; sourceName: string } | null;
+  excerpt: { itemId?: string; text: string; sourceId?: string; sourceName: string } | null;
   latest: string | null;
   /** The current public report supplying latest; never inferred from an independently generated digest. */
   latestReport: { id: string } | null;
@@ -316,6 +319,7 @@ export type ReportKind = "daily" | "weekly" | "monthly";
 
 /** What each kind of report is called. */
 export const REPORT_NAMES: Record<ReportKind, string> = { daily: "日报", weekly: "周报", monthly: "月报" };
+export const REPORT_NAMES_EN: Record<ReportKind, string> = { daily: "Daily", weekly: "Weekly", monthly: "Monthly" };
 
 /** An issue's date as Chinese readers write and search it: "10月17日", "10月12日—18日" (or "9月28日—10月4日"), "2026年10月". */
 export function reportDateLabel(kind: ReportKind, key: string): string {
@@ -325,10 +329,19 @@ export function reportDateLabel(kind: ReportKind, key: string): string {
   return `${monthDay(start)}—${start.slice(5, 7) === end.slice(5, 7) ? `${Number(end.slice(8, 10))}日` : monthDay(end)}`;
 }
 
+/** reportDateLabel on English pages: "Oct 17", "Oct 12–18" (or "Sep 28 – Oct 4"), "October 2026". */
+export function reportDateLabelEn(kind: ReportKind, key: string): string {
+  if (kind === "daily") return monthDayEn(key);
+  if (kind === "monthly") return longDateEn(key);
+  const { start, end } = isoWeekRange(key)!;
+  return start.slice(5, 7) === end.slice(5, 7) ? `${monthDayEn(start)}–${Number(end.slice(8, 10))}` : `${monthDayEn(start)} – ${monthDayEn(end)}`;
+}
+
 export interface ReportCitation {
   itemId: string | null;
   title: string;
   summary: string | null;
+  sourceId?: string | null;
   sourceName: string;
   sourceUrl: string;
   sourceIconUrl: string | null;
@@ -361,7 +374,7 @@ export interface ReportDetail {
   overview: string | null;
   highlights: ReportCitation[];
   /** As edited: daily categories, weekly and monthly themes. */
-  sections: Array<{ label: string; summary: string | null; items: ReportCitation[] }>;
+  sections: Array<{ key?: string; label: string; summary: string | null; items: ReportCitation[] }>;
   flashes: ReportCitation[];
   /**
    * The front page's picture: from the lead item (a daily's lead, a weekly or monthly's first highlight),
@@ -406,6 +419,8 @@ export interface SiteMeta {
 
 /** One entry of the site's changelog (site/changelog.json), newest first. */
 export interface ChangelogRelease {
+  /** Stable canonical release id (e.g. "2026-11-15-1757"). */
+  id?: string;
   date: string;
   time: string;
   kind: "更新" | "优化" | "公告" | "下线";
@@ -452,7 +467,7 @@ export interface SiteStats {
 
 export interface StoryFollowup {
   factId: string;
-  representative: { id: string; title: string; source: { name: string }; timelineAt: string };
+  representative: { id: string; title: string; source: SourceRef; timelineAt: string };
 }
 export interface StoryFollowupsResponse { items: StoryFollowup[]; more: boolean }
 
@@ -463,6 +478,9 @@ export interface StoryFollowupsResponse { items: StoryFollowup[]; more: boolean 
 export interface ItemAvailability {
   status: "public" | "summary-only" | "unavailable";
   sourceName?: string;
+  /** The current public title and summary in the requested language. */
+  title?: string;
+  summary?: string | null;
 }
 
 /** An issue in the archive and the calendar, numbered in its whole series; closed daily months omit their titles. */
@@ -506,7 +524,7 @@ export interface TopicSummary extends TopicLink {
   /** Enough content to be listed and indexed. */
   indexable: boolean;
   /** The newest selected report. */
-  latest: { title: string; at: string } | null;
+  latest: { id?: string; title: string; at: string } | null;
 }
 
 export interface TopicsResponse {

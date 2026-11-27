@@ -1,7 +1,7 @@
 // Collection run for one source: fetch listing → filter → store material → enqueue processing.
 // A failed fetch never advances the success cursor; the source's health reflects consecutive failures.
 import { sql, type Db } from "../db.ts";
-import { fillScheduledPublications, FUTURE_TOLERANCE_MS, identityKeyFor, materialIdentityForUrl, reuseExternalMaterialIdentities, STALE_ON_DISCOVERY_MS, upsertMaterial } from "../content/materials.ts";
+import { fillScheduledPublications, FUTURE_TOLERANCE_MS, resolveMaterialIdentity, reuseExternalMaterialIdentities, STALE_ON_DISCOVERY_MS, upsertMaterial } from "../content/materials.ts";
 import { PresentationMismatch } from "../content/presentation.ts";
 import { HttpStatusError } from "../lib/http-fetch.ts";
 import { identityKeyForUrl } from "../lib/url.ts";
@@ -10,12 +10,14 @@ import { enqueue, QUEUES, shutdownSignal } from "../jobs/queue.ts";
 import { runOwner } from "../jobs/runs.ts";
 import { queueProcessing } from "../jobs/content.ts";
 import { BudgetExceededError, completeReceipt } from "../providers/receipts.ts";
+import { socialdataServerError } from "../providers/socialdata.ts";
 import { fetchRss } from "./rss.ts";
 import { fetchDetail, fetchWebList, isCallToActionTitle, needsTitle, type DetailNeed } from "./web-list.ts";
 import { unsupportedConfig } from "./config-keys.ts";
 import { admitListing, filterPublicationWindow } from "./filters.ts";
 import { fetchJsonList } from "./json-list.ts";
 import { fetchXSearch, planXShards, readXSearch, shardHandle, shardQuery, selfThreadHandle, SHARDABLE_SQL, tweetToCandidate, type XBacklog } from "./x.ts";
+import { xHandle } from "./account.ts";
 import { FetchError, type Candidate, type SourceRow } from "./types.ts";
 import { readsWhole, usePace } from "./uses.ts";
 import { pageFetchable } from "../content/extract.ts";
@@ -80,11 +82,8 @@ export async function listingEntries(source: SourceRow, found: Candidate[]): Pro
   const unreliableDates = source.config.detail?.publishedAtAuthoritative === true;
   const unique = new Map<string, CollectionCandidate>();
   for (const c of candidates) {
-    const requestedIdentity = c.identityKey
-      ?? (source.config.preserveUrlFragment === true ? identityKeyForUrl(c.url, { keepFragment: true }) : null)
-      ?? identityKeyFor({ ...c, sourceId: source.id, via: "fetch" });
-    const identityKey = requestedIdentity === identityKeyForUrl(c.url)
-      ? await materialIdentityForUrl(c.url) ?? requestedIdentity : requestedIdentity;
+    const explicitKey = c.identityKey ?? (source.config.preserveUrlFragment === true ? identityKeyForUrl(c.url, { keepFragment: true }) : null);
+    const identityKey = await resolveMaterialIdentity({ ...c, sourceId: source.id, via: "fetch", identityKey: explicitKey ?? undefined });
     if (!unique.has(identityKey)) unique.set(identityKey, { ...c, identityKey, ...(unreliableDates && !c.listingDatesOriginal ? { publishedAt: null, publicationTime: null } : {}) });
   }
   return [...unique.values()];
@@ -262,9 +261,9 @@ export async function enrichDetails(candidates: CollectionCandidate[], source: S
  * feed's text), the page's head is read once. An article without a body yet takes its cover when the body is
  * extracted from its page.
  */
-async function storeCover(articleId: string, created: boolean, c: CollectionCandidate, kind: string): Promise<void> {
+async function storeCover(articleId: string, sourceId: string, created: boolean, c: CollectionCandidate, kind: string): Promise<void> {
   if (c.bodyStatus !== "ok" || !c.bodyHtml || hasPicture(c.bodyHtml) || !pageFetchable(c.url, kind)) return;
-  const cover = c.cover !== undefined ? c.cover : created ? await fetchArticleCover(c.url) : null;
+  const cover = c.cover !== undefined ? c.cover : created ? await fetchArticleCover(c.url, sourceId) : null;
   if (cover) await sql`UPDATE articles SET cover = ${sql.json(cover as never)} WHERE id = ${articleId} AND cover IS NULL`;
 }
 
@@ -286,7 +285,7 @@ async function store(sourceId: string, kind: string, candidates: CollectionCandi
     if (c.detailRules) await sql`UPDATE articles SET raw = jsonb_set(
       CASE WHEN jsonb_typeof(raw) = 'object' THEN raw ELSE '{}'::jsonb END,
       '{collectionDetail}', ${sql.json({ rules: c.detailRules })}) WHERE id = ${res.articleId} AND source_id = ${sourceId}`;
-    await storeCover(res.articleId, res.created, c, kind);
+    await storeCover(res.articleId, sourceId, res.created, c, kind);
     if (res.created) created += 1;
     if (res.revised) revised += 1;
     // Extraction first when the source wants full text and none came with the listing, else analysis.
@@ -296,11 +295,25 @@ async function store(sourceId: string, kind: string, candidates: CollectionCandi
 }
 
 /**
- * The end of a fetch run, on the run and on its source. Success marks the source healthy and due again
- * one interval later. A failure counts toward "failing" (5 in a row) and waits longer after each one,
- * up to six hours; a full budget is not the source's failure: it waits 15 minutes and counts nothing.
+ * Why a run failed. "budget": a full budget, not the source's failure. "provider": SocialData could not
+ * get the data from X (socialdataServerError); it counts, but the account is read again at its usual pace,
+ * because waiting longer bought nothing: 2026-11-21..26, in 455 of the 456 waits over 90 minutes after such a
+ * failure, other searches already worked meanwhile, and one shard went 21 hours unread. "source": anything else.
  */
-async function recordFetch(db: Db, sourceId: string, runId: number, run: { found: number; created: number; detail: object | null } & ({ cursor: Record<string, unknown> } | { error: string; budget: boolean })): Promise<void> {
+type FailureCause = "budget" | "provider" | "source";
+
+function failureCause(error: unknown): FailureCause {
+  if (error instanceof BudgetExceededError) return "budget";
+  return socialdataServerError(error) ? "provider" : "source";
+}
+
+/**
+ * The end of a fetch run, on the run and on its source. Success marks the source healthy and due again
+ * one interval later. A failure counts toward "failing" (5 in a row); the source's own failure waits longer
+ * after each one, up to six hours, the provider's waits one interval; a full budget waits 15 minutes and
+ * counts nothing.
+ */
+async function recordFetch(db: Db, sourceId: string, runId: number, run: { found: number; created: number; detail: object | null } & ({ cursor: Record<string, unknown> } | { error: string; cause: FailureCause })): Promise<void> {
   const detail = run.detail ? db.json(run.detail as never) : null;
   if ("cursor" in run) {
     const changed = await db`UPDATE fetch_runs SET status = 'ok', finished_at = now(), found_count = ${run.found}, new_count = ${run.created},
@@ -316,12 +329,14 @@ async function recordFetch(db: Db, sourceId: string, runId: number, run: { found
   const changed = await db`UPDATE fetch_runs SET status = 'failed', finished_at = now(), found_count = ${run.found}, new_count = ${run.created},
     error = ${run.error}, detail = nullif(coalesce(detail,'{}'::jsonb) || coalesce(${detail}::jsonb,'{}'::jsonb),'{}'::jsonb) WHERE id = ${runId} AND status = 'running'`;
   if (!changed.count) return;
+  const budget = run.cause === "budget";
   await db`
     UPDATE sources SET last_fetch_at = now(),
-      fail_count = CASE WHEN ${run.budget} THEN fail_count ELSE fail_count + 1 END,
+      fail_count = CASE WHEN ${budget} THEN fail_count ELSE fail_count + 1 END,
       last_error = ${run.error},
-      health = CASE WHEN NOT enabled THEN 'paused' WHEN ${run.budget} THEN health WHEN fail_count + 1 >= 5 THEN 'failing' ELSE 'degraded' END,
-      next_fetch_at = now() + make_interval(mins => CASE WHEN ${run.budget} THEN 15 ELSE LEAST(interval_minutes * (fail_count + 2), 360) END),
+      health = CASE WHEN NOT enabled THEN 'paused' WHEN ${budget} THEN health WHEN fail_count + 1 >= 5 THEN 'failing' ELSE 'degraded' END,
+      next_fetch_at = now() + make_interval(mins => CASE WHEN ${budget} THEN 15 WHEN ${run.cause === "provider"} THEN interval_minutes
+        ELSE LEAST(interval_minutes * (fail_count + 2), 360) END),
       updated_at = now()
     WHERE id = ${sourceId}`;
 }
@@ -347,6 +362,7 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
     if (unsupported.length) throw new FetchError(`unsupported config: ${unsupported.join(", ")}`);
     let candidates: CollectionCandidate[];
     let paidReceiptIds: number[] = [];
+    let learnedXUserId: string | null = null;
     let nextCursor: Record<string, unknown> = { ...(source.cursor ?? {}) };
     let detail: Record<string, unknown> | null = null;
     const d = source.config.detail;
@@ -368,6 +384,12 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
       const x = await fetchXSearch(source, opts.xSince);
       candidates = x.candidates;
       paidReceiptIds = x.receiptIds;
+      if (!source.config.xUserId) {
+        const expectedHandle = xHandle(source.config)?.toLowerCase();
+        if (expectedHandle) {
+          learnedXUserId = candidates.find((c) => c.xPost?.authorUserId && c.xPost.handle.toLowerCase() === expectedHandle)?.xPost?.authorUserId ?? null;
+        }
+      }
       if (x.lastId && !(nextCursor.lastTweetId && BigInt(String(nextCursor.lastTweetId)) > BigInt(x.lastId))) nextCursor.lastTweetId = x.lastId;
       // A search longer than one run keeps its position for the next runs (shown in the admin).
       if (x.backlog.length) nextCursor.xBacklog = x.backlog;
@@ -421,6 +443,9 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
     nextCursor.lastOkAt = new Date().toISOString();
     await sql.begin(async (tx) => {
       await recordFetch(tx, sourceId, run!.id, { found, created, detail, cursor: nextCursor });
+      if (learnedXUserId) {
+        await tx`UPDATE sources SET config = jsonb_set(config, '{xUserId}', to_jsonb(${learnedXUserId}::text)) WHERE id = ${sourceId} AND config->>'xUserId' IS NULL`;
+      }
       for (const receiptId of paidReceiptIds) await completeReceipt(tx, receiptId);
     });
     return { sourceId, status: "ok", found, created, revised };
@@ -431,7 +456,7 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
       throw error;
     }
     const message = String(error instanceof Error ? error.message : error).slice(0, 1000);
-    await sql.begin(tx => recordFetch(tx, sourceId, run!.id, { found, created, detail: null, error: message, budget: error instanceof BudgetExceededError }));
+    await sql.begin(tx => recordFetch(tx, sourceId, run!.id, { found, created, detail: null, error: message, cause: failureCause(error) }));
     return { sourceId, status: "failed", found, created, revised, error: message };
   }
 }
@@ -480,28 +505,30 @@ export async function collectXShard(key: string, sourceIds: string[]): Promise<{
     const backlog: XBacklog[] = members.flatMap((m) => (Array.isArray(m.cursor?.xBacklog) ? m.cursor.xBacklog as XBacklog[] : []));
     const read = await readXSearch(shardQuery(members.map((m) => shardHandle(m)!), members.map(selfThreadHandle).filter((h): h is string => h !== null)), { lastId: String(since), backlog, subject: `x-shard:${key}` });
     const detail = { shard: key, accounts: members.length, pages: read.pages, truncated: read.truncated, backlog: read.backlog.length, backlogPages: read.backlogPages, dropped: read.dropped };
-    const counts = new Map<string, { found: number; created: number; newest: string }>();
+    const counts = new Map<string, { found: number; created: number; newest: string; learnedXUserId: string | null }>();
+    const matchesAccount = (m: SourceRow, t: { user: { id_str?: string; screen_name: string } }) =>
+      m.config.xUserId && t.user.id_str
+        ? t.user.id_str === String(m.config.xUserId)
+        : t.user.screen_name.toLowerCase() === shardHandle(m)?.toLowerCase();
     for (const m of members) {
-      const handle = shardHandle(m)!.toLowerCase();
-      const mine = read.tweets.filter((t) => t.user.screen_name.toLowerCase() === handle);
+      const mine = read.tweets.filter((t) => matchesAccount(m, t));
       const stored = await store(m.id, m.kind, admitListing(mine.map(tweetToCandidate), m), null);
       found += mine.length;
       created += stored.created;
       const newest = mine.reduce((a, t) => (BigInt(t.id_str) > BigInt(a) ? t.id_str : a), String(m.cursor!.lastTweetId));
-      counts.set(m.id, { found: mine.length, created: stored.created, newest });
+      const learnedXUserId = !m.config.xUserId ? (mine.find((t) => t.user.id_str)?.user.id_str ?? null) : null;
+      counts.set(m.id, { found: mine.length, created: stored.created, newest, learnedXUserId });
     }
     // A stretch left over before a regrouping still names accounts now in other shards, which hold no copy
     // of it and whose coverage has moved on: their posts go to them from here.
-    const here = new Set(members.map((m) => shardHandle(m)!.toLowerCase()));
-    const strays = read.tweets.filter((t) => !here.has(t.user.screen_name.toLowerCase()));
+    const strays = read.tweets.filter((t) => !members.some((m) => matchesAccount(m, t)));
     if (strays.length) {
-      const owners = await sql<SourceRow[]>`
+      const accounts = await sql<SourceRow[]>`
         SELECT id, name, kind, config, tier, participation_mode, uses, interval_minutes, enabled, cursor, fail_count
         FROM sources WHERE enabled AND ${sharded()}`;
-      for (const owner of owners) {
-        const handle = shardHandle(owner)?.toLowerCase();
-        const mine = strays.filter((t) => t.user.screen_name.toLowerCase() === handle);
-        if (mine.length) created += (await store(owner.id, owner.kind, admitListing(mine.map(tweetToCandidate), owner), null)).created;
+      for (const account of accounts) {
+        const mine = strays.filter((t) => matchesAccount(account, t));
+        if (mine.length) created += (await store(account.id, account.kind, admitListing(mine.map(tweetToCandidate), account), null)).created;
       }
     }
     // Only a fully stored search advances coverage. A failed write can replay every paid page;
@@ -511,11 +538,14 @@ export async function collectXShard(key: string, sourceIds: string[]): Promise<{
     const keeper = members[0]!.id;
     await sql.begin(async tx => {
       for (const m of members) {
-        const { newest, ...count } = counts.get(m.id)!;
+        const { newest, learnedXUserId, ...count } = counts.get(m.id)!;
         const cursor: Record<string, unknown> = { ...m.cursor, lastTweetId: newest, lastOkAt: new Date().toISOString() };
         if (read.backlog.length && m.id === keeper) cursor.xBacklog = read.backlog;
         else delete cursor.xBacklog;
         await recordFetch(tx, m.id, runs.get(m.id)!, { ...count, detail, cursor });
+        if (learnedXUserId) {
+          await tx`UPDATE sources SET config = jsonb_set(config, '{xUserId}', to_jsonb(${learnedXUserId}::text)) WHERE id = ${m.id} AND config->>'xUserId' IS NULL`;
+        }
       }
       for (const receiptId of read.receiptIds) await completeReceipt(tx, receiptId);
     });
@@ -527,10 +557,10 @@ export async function collectXShard(key: string, sourceIds: string[]): Promise<{
       throw error;
     }
     const message = String(error instanceof Error ? error.message : error).slice(0, 1000);
-    const budget = error instanceof BudgetExceededError;
+    const cause = failureCause(error);
     await sql.begin(async tx => {
       for (const m of members) {
-        await recordFetch(tx, m.id, runs.get(m.id)!, { found: 0, created: 0, detail: { shard: key, accounts: members.length }, error: message, budget });
+        await recordFetch(tx, m.id, runs.get(m.id)!, { found: 0, created: 0, detail: { shard: key, accounts: members.length }, error: message, cause });
       }
     });
     return { key, status: "failed", accounts: members.length, found, created, error: message };

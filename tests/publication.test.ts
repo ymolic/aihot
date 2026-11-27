@@ -8,6 +8,8 @@ import { randomUUID } from "node:crypto";
 import * as cheerio from "cheerio";
 import { marked } from "marked";
 import { after, before, test } from "node:test";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { MCP_TOOL_NAMES } from "@aihot/contracts/mcp";
 import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import { overrideFields, setVisibility } from "@aihot/backend/admin/content";
@@ -17,7 +19,6 @@ import { stopBoss } from "@aihot/backend/jobs/queue";
 import { publishArticle, republishSource } from "@aihot/backend/publication/publish";
 import { computeHotRanking } from "@aihot/backend/events/hot";
 import { latestHotRanking } from "@aihot/backend/publication/hot";
-import { itemFeed } from "@aihot/backend/publication/feeds";
 import { loadPool } from "@aihot/backend/publication/pool";
 import { digestReports } from "@aihot/backend/publication/story-evidence";
 import { v1Items } from "@aihot/backend/publication/v1";
@@ -322,7 +323,7 @@ test("item pages follow one rule: unsummarised editorial items keep one, hot_sig
   await sql`INSERT INTO sources (id, name, kind, tier, participation_mode, site_fulltext, syndicate_fulltext, next_fetch_at)
             VALUES (${SIGNAL}, 'Test signal', 'rss', 'T1', 'hot_signal', true, false, '2100-01-01')`;
   const material = (sourceId: string, name: string) =>
-    upsertMaterial({ sourceId, url: `https://example.com/${T}-${name}`, title: `${name} ${T}`, bodyText: BODY, bodyHtml: `<p>${BODY}</p>`, bodyStatus: "ok", via: "fetch", publishedAt: new Date() });
+    upsertMaterial({ sourceId, url: `https://example.com/${T}-${name}`, title: `${name} ${T}`, bodyText: BODY, bodyHtml: `<p>${BODY}</p>`, bodyStatus: "ok", via: "fetch", publishedAt: new Date(Date.now() - 60_000) });
   // An editorial item the model never summarised, and a hot_signal item carrying an imported summary.
   const { articleId: plain } = await material(SOURCE, "plain");
   await publishArticle(plain);
@@ -420,7 +421,7 @@ test("v1 story matches the website's content and fallback ordering", async () =>
   assert.equal(v1.latest, site.latest);
   assert.equal(site.latestReport.id, second);
   assert.deepEqual(v1.reports.map(({ links: { original: _, ...links }, ...r }: any) => ({ ...r, links })), site.timeline.slice(0, 50).map((r: any) => ({ id: r.id, title: r.title, summary: r.summary,
-    source: { name: r.source.name, firstParty: r.source.firstParty }, publishedAt: r.publishedAt, links: { aihot: `${config.siteUrl}/items/${r.id}` } })));
+    source: { id: r.source.id, name: r.source.name, firstParty: r.source.firstParty }, publishedAt: r.publishedAt, links: { aihot: `${config.siteUrl}/items/${r.id}` } })));
 });
 
 // An event's public id is kept by search engines and installed clients: once merged, it must lead to the
@@ -432,6 +433,9 @@ test("a merged event's old public id answers 308 to the surviving event", async 
   const res = await app.inject({ method: "GET", url: `/api/v1/stories/${merged}` });
   assert.equal(res.statusCode, 308, "a merged public id is a permanent redirect, not a 404");
   assert.equal(res.headers.location, `/api/v1/stories/${current}`, "relative Location to the surviving event");
+  const og = await app.inject({ method: "GET", url: `/og/stories/${merged}.png` });
+  assert.equal(og.statusCode, 308, "a merged story OG image redirects to the surviving story");
+  assert.equal(og.headers.location, `/og/stories/${current}.png`);
 });
 
 test('event neighbors disappear when their last readable evidence is withdrawn', async () => {
@@ -622,16 +626,24 @@ test("browsing 全部动态 on every exit leaves out items below the floor, whic
   const ours = (ids: string[]) => ids.filter((i) => i.startsWith(`${T}-floor-`)).sort();
   const now = new Date();
 
-  const pool = await loadPool({ channel: "all", category: null, tag: `${T}-floor`, now });
-  assert.deepEqual(ours(pool.items.map((i) => i.id)), shown, "web list");
+  const pool = JSON.parse((await get(`/api/site/pool?tag=${T}-floor`)).body);
+  assert.deepEqual(ours(pool.items.map((i: { id: string }) => i.id)), shown, "网页列表请通过 loadPool 使用 browsedCondition");
   assert.equal(pool.total, shown.length, "web page count");
-  const v1 = await v1Items({ mode: "all", window: "24h", by: "timeline", category: null, q: null, limit: 100, cursor: null }, now);
-  assert.deepEqual(ours(v1.items.map((i) => i.id)), shown, "v1 and MCP");
+  const v1 = JSON.parse((await get("/api/v1/items?mode=all&limit=50")).body);
+  assert.deepEqual(ours(v1.items.map((i: { id: string }) => i.id)), shown, "公开接口请通过 v1Items 使用 browsedCondition");
+  const address = await app.listen({ host: "127.0.0.1", port: 0 });
+  const client = new Client({ name: "publication-test", version: "1.0.0" });
+  try {
+    await client.connect(new StreamableHTTPClientTransport(new URL("/api/mcp", address)));
+    const result = await client.callTool({ name: MCP_TOOL_NAMES.latest, arguments: { mode: "all", limit: 30 } });
+    assert.equal(result.isError, undefined);
+    assert.deepEqual(ours((result.structuredContent as { items: { id: string }[] }).items.map(i => i.id)), shown, "MCP 最新动态请读取 v1Items");
+  } finally { await client.close(); }
   const agent = await get("/api/v1/agent/latest?mode=all&limit=30");
   assert.equal(agent.status, 200);
-  assert.ok(agent.body.includes(id("edge")) && !agent.body.includes(id("low")), "Agent latest");
-  const rss = await itemFeed("all", null, { now });
-  assert.ok(rss.includes(id("edge")) && rss.includes(id("unscored")) && !rss.includes(id("low")), "all RSS");
+  assert.ok(shown.every(item => agent.body.includes(item)) && !agent.body.includes(id("low")), "Agent 最新动态请读取 v1Items");
+  const rss = (await get("/feed/all.xml")).body;
+  assert.ok(rss.includes(id("edge")) && rss.includes(id("unscored")) && !rss.includes(id("low")), "全部动态 RSS 请使用 browsedCondition");
 
   const found = await loadPool({ channel: "all", category: null, tag: `${T}-floor`, q: id("low"), now });
   assert.deepEqual(ours(found.items.map((i) => i.id)), [id("low")], "web search");

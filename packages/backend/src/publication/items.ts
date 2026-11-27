@@ -2,7 +2,8 @@
 // items through these columns and views; which rows are public is decided by scope.ts.
 import { CATEGORY_KEYS, toPublicApiCategory, type CategoryKey, type ChannelKey, type PublicApiCategoryKey } from "@aihot/contracts/taxonomy";
 import { STORY_INDEX_MIN_SOURCES, type FeedItemSummary, type ItemSummary, type MediaView, type XPostView } from "@aihot/contracts/site";
-import { POLICY } from "@aihot/site";
+import { itemUrl } from "./links.ts";
+import { POLICY, SITE } from "@aihot/site";
 import { sql, type Db } from "../db.ts";
 import { isChineseText } from "../lib/text.ts";
 import { isEmptyOrLinkOnly, withXArticle } from "../content/posts.ts";
@@ -33,6 +34,7 @@ export interface ItemRow {
   suppress_original?: boolean;
   indexable: boolean;
   fact_id: number | null;
+  source_id: string;
   source_name: string;
   /** Participation mode of the source now (editorial, hot_signal, isolated). */
   source_mode: string;
@@ -50,15 +52,18 @@ export interface ItemRow {
   quoted_zh: string | null;
 }
 
+/** The article fields shared by the website, API, Agent tools and both RSS formats. */
+export const PUBLIC_ITEM_COLUMNS = sql`p.article_id AS id, p.title, p.summary, p.url, p.category, p.published_at, s.name AS source_name`;
+
 /** Columns every item listing selects. Internal judgement details never leave this layer. */
 export const ITEM_COLUMNS = sql`
-  p.article_id AS id, p.title, p.original_title, p.summary, p.reason, p.category, p.tags, p.score,
-  p.selected, p.seat, p.channel, p.url, p.published_at, p.discovered_at, p.timeline_at, p.visibility,
-  p.body_mode, p.suppress_original, p.indexable, p.fact_id, s.name AS source_name, s.participation_mode AS source_mode,
+  ${PUBLIC_ITEM_COLUMNS}, p.original_title, p.reason, p.tags, p.score,
+  p.selected, p.seat, p.channel, p.discovered_at, p.timeline_at, p.visibility,
+  p.body_mode, p.suppress_original, p.indexable, p.fact_id, s.id AS source_id, s.participation_mode AS source_mode,
   CASE WHEN NOT p.suppress_original THEN a.x_post END AS x_post,
-  CASE WHEN p.body_mode = 'full' AND NOT p.suppress_original THEN a.x_article - 'html' END AS x_article,
+  CASE WHEN p.body_mode = 'full' THEN a.x_article - 'html' END AS x_article,
   a.author, a.language,
-  CASE WHEN NOT p.suppress_original AND s.kind = 'x_search' AND ${sourceOwnsPost(sql`s.config`, sql`a.x_post->>'handle'`)} THEN s.icon_url END AS author_avatar_url,
+  CASE WHEN NOT p.suppress_original AND s.kind = 'x_search' AND ${sourceOwnsPost(sql`s.config`, sql`a.x_post`)} THEN s.icon_url END AS author_avatar_url,
   st.public_id::text AS story_public_id, st.title AS story_title,
   CASE WHEN p.channel = 'x' AND NOT p.suppress_original THEN tr.body_text END AS zh_text,
   CASE WHEN NOT p.suppress_original THEN qt.text_zh END AS quoted_zh`;
@@ -67,8 +72,42 @@ export const ITEM_COLUMNS = sql`
 export type ApiItemRow = Pick<ItemRow, "id" | "title" | "original_title" | "summary" | "source_name" | "url" | "published_at" | "discovered_at" | "category" | "score" | "selected" | "reason">;
 /** `selected` is the machine meaning: the report holds its fact's selected seat (scope.ts seatedCondition). */
 export const API_ITEM_COLUMNS = sql`
-  p.article_id AS id, p.title, p.original_title, p.summary, s.name AS source_name, p.url,
-  p.published_at, p.discovered_at, p.category, p.score, (p.selected AND p.seat) AS selected, p.reason`;
+  ${PUBLIC_ITEM_COLUMNS}, p.original_title, p.discovered_at, p.score, (p.selected AND p.seat) AS selected, p.reason`;
+export interface V1ItemPayload {
+  id: string;
+  title: string;
+  originalTitle: string | null;
+  summary: string | null;
+  source: { name: string };
+  links: { aihot: string; original: string };
+  publishedAt: string | null;
+  discoveredAt: string;
+  category: string | null;
+  score: number | null;
+  selected: boolean;
+  reason: string | null;
+  attribution: { name: string; url: string };
+}
+
+export function rowToV1(p: ApiItemRow): V1ItemPayload {
+  const aihot = itemUrl(p.id);
+  return {
+    id: p.id,
+    title: p.title,
+    originalTitle: p.original_title,
+    summary: p.summary,
+    source: { name: p.source_name },
+    links: { aihot, original: p.url },
+    publishedAt: p.published_at ? p.published_at.toISOString() : null,
+    discoveredAt: p.discovered_at.toISOString(),
+    category: toPublicApiCategory(p.category),
+    score: p.score === null ? null : Math.round(Number(p.score)),
+    selected: p.selected,
+    reason: p.selected ? p.reason : null,
+    attribution: { name: SITE.name, url: aihot },
+  };
+}
+
 export const API_ITEM_FROM = sql`FROM publications p JOIN sources s ON s.id = p.source_id`;
 
 /** A translation of an older revision is left out: the original changed after it (the worker translates it again). */
@@ -78,7 +117,7 @@ export const ITEM_FROM = sql`
   JOIN articles a ON a.id = p.article_id
   LEFT JOIN stories st ON st.id = p.story_id AND st.merged_into IS NULL
   LEFT JOIN translations tr ON tr.article_id = p.article_id AND tr.lang = 'zh' AND tr.revision >= a.revision
-  LEFT JOIN quote_translations qt ON p.channel = 'x' AND qt.tweet_id = substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)')`;
+  LEFT JOIN quote_translations qt ON p.channel = 'x' AND qt.tweet_id = coalesce(a.x_post->'quoted'->>'tweetId', substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)'))`;
 
 export function channelCondition(channel: ChannelKey | null | undefined) {
   if (!channel || channel === "all") return sql``;
@@ -104,13 +143,14 @@ export function tagCondition(tag: string | null | undefined) {
 }
 
 function mediaView(m: Record<string, any>, mode: "card" | "thumb" | "full" = "thumb", responsive = false): MediaView | null {
-  const url = proxiedImage(m.url, mode);
+  const detail = mode === "full" && responsive;
+  const url = proxiedImage(m.url, detail ? "reading" : mode);
   if (!url) return null;
-  const srcSet = responsive ? proxiedImageSet(m.poster ?? m.url, mode === "full" ? "body" : "card") : null;
+  const srcSet = responsive && !detail ? proxiedImageSet(m.poster ?? m.url, "card") : null;
   return {
     kind: m.kind === "video" ? "video" : "image",
     url,
-    ...(responsive && mode !== "full" ? { fullUrl: proxiedImage(m.url, "full")! } : {}),
+    ...(responsive ? { fullUrl: proxiedImage(m.url, "full")! } : {}),
     ...(srcSet ? { srcSet } : {}),
     width: typeof m.width === "number" ? m.width : null,
     height: typeof m.height === "number" ? m.height : null,
@@ -144,7 +184,7 @@ export function xView(row: Pick<ItemRow, "x_post" | "zh_text"> & Partial<Pick<It
     quoted,
     article: !!row.x_article?.text,
     // A multi-image list grid is 112 CSS px wide; one image can be 240 px. Keep 3x pixels for both.
-    // Detail retains full media for the lightbox; srcSet bounds the displayed image.
+    // The detail preview and its on-demand full image have separate addresses.
     media: media.map(({ raw, view }) => compact && media.length > 1 ? mediaView(raw, "card", responsive)! : view),
   };
 }
@@ -171,7 +211,7 @@ export const THIN_PAGE_CHARS = 300;
  */
 export function thinPageCondition() {
   const post = POLICY.xPostIsFullText
-    ? sql`p.channel = 'x' AND NOT p.suppress_original AND p.body_mode = 'full'`
+    ? sql`p.channel = 'x' AND p.body_mode = 'full'`
     : sql`p.channel = 'x' AND NOT p.suppress_original`;
   return sql`(p.seo_indexed_at IS NULL AND CASE
     WHEN ${post} THEN char_length(CASE WHEN a.x_post IS NULL THEN coalesce(a.body_text, '') ELSE coalesce(a.x_post->>'text', '') END)
@@ -207,7 +247,7 @@ export function toItemSummary(row: ItemRow): ItemSummary {
     originalTitle: row.original_title,
     summary: row.summary,
     reason: row.selected ? row.reason : null,
-    source: { name: publicSourceName(row.source_name) },
+    source: { id: row.source_id, name: publicSourceName(row.source_name) },
     links: { original: row.url },
     publishedAt: row.published_at?.toISOString() ?? null,
     discoveredAt: row.discovered_at.toISOString(),

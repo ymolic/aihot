@@ -1,3 +1,4 @@
+import { pollFor } from "./poll.ts";
 // Feedback reaches the internal Feishu chat with its screenshot even when Feishu fails at first: a
 // failed upload or send is tried again, only the Feishu image key is kept, a screenshot that cannot be
 // uploaded for a day, or that Feishu refuses outright, is dropped (the text still goes), screenshots left
@@ -25,7 +26,7 @@ import { config } from "@aihot/backend/config";
 import { closeDb, sql } from "@aihot/backend/db";
 import { forwardFeedbackToFeishu } from "@aihot/backend/notify/feishu";
 import { defineServerModule, installModules } from "@aihot/backend/modules";
-import { forwardPendingFeedback, sniffImageType, submitFeedback, FeedbackRejected, feedbackSourceHash, feedbackEmailKey } from "@aihot/backend/operations/feedback";
+import { forwardPendingFeedback, moduleHandlesFeedback, sitePath, sniffImageType, submitFeedback, FeedbackRejected, feedbackSourceHash, feedbackEmailKey } from "@aihot/backend/operations/feedback";
 import { dailyRetention } from "@aihot/backend/operations/retention";
 import { buildApp } from "../apps/api/src/app.ts";
 import { registerAdmin } from "../apps/api/src/routes/admin.ts";
@@ -184,7 +185,7 @@ test("a browser retry creates one feedback and forwards one notification", async
   const results = await Promise.all(Array.from({ length: 4 }, () => submitFeedback(input)));
   assert.equal(new Set(results.map(r => r.id)).size, 1);
   const id = results[0]!.id;
-  for (let i = 0; i < 100 && !(await state(id)).forwarded; i++) await new Promise(resolve => setTimeout(resolve, 10));
+  await pollFor(async () => (await state(id)).forwarded, "feedback forwarding");
   assert.ok((await state(id)).forwarded);
   assert.equal(feishu.sent.filter(m => m.title === `反馈 #${id}`).length, 1);
   assert.ok(JSON.stringify(sentFor(id)?.content).includes(input.content));
@@ -228,6 +229,10 @@ test("a report the model reads as empty is marked spam and not pushed; a real on
     assert.ok(sentFor(real));
     assert.equal((await record(real)).status, "new");
 
+    const receipts = await sql<{ status: string }[]>`SELECT status FROM receipts WHERE purpose = 'judge_feedback'
+      AND subject IN (${`feedback:${empty}`}, ${`feedback:${real}`})`;
+    assert.deepEqual(receipts.map(r => r.status), ["completed", "completed"]);
+
     model.fails = true;
     const down = await pending("模型挂了的时候提的反馈");
     await forwardPendingFeedback();
@@ -252,6 +257,7 @@ test("a report the model reads as empty is marked spam and not pushed; a real on
 });
 
 test("a report from a page a module takes itself stays out of the chat; its screenshot still goes to Feishu and is read back from there", async () => {
+  const originalSiteUrl = config.siteUrl;
   installModules([defineServerModule({ name: "deals", feedbackPages: ["/deals"] })]);
   try {
     const from = async (pageUrl: string) => {
@@ -289,7 +295,24 @@ test("a report from a page a module takes itself stays out of the chat; its scre
 
     const { id: plain } = await submitFeedback({ content: `没带截图的反馈 ${T}`, ip: "198.51.100.250", userAgent: "Firefox" });
     assert.equal(await readFeedbackScreenshot(plain), null);
+
+    // The www alias needs a domain name; CI also runs with a loopback IP as SITE_URL.
+    config.siteUrl = "https://site.example";
+    const previewUrl = "https://www.SITE.EXAMPLE/preview/Deals/?tab=1";
+    assert.equal(sitePath(previewUrl), "/deals");
+    assert.equal(sitePath("/preview/deals/"), "/deals");
+    assert.equal(sitePath("https://evil.example/deals"), null);
+    assert.equal(moduleHandlesFeedback(previewUrl), true);
+    const { id: previewId } = await submitFeedback({
+      content: `预览路径反馈 ${T}`,
+      pageUrl: previewUrl,
+      ip: "198.51.100.251",
+      userAgent: "Firefox",
+    });
+    const [surfaceRow] = await sql<{ surface_id: string | null }[]>`SELECT surface_id FROM feedback WHERE id = ${previewId}`;
+    assert.equal(surfaceRow!.surface_id, "/deals");
   } finally {
+    config.siteUrl = originalSiteUrl;
     installModules([]);
   }
 });

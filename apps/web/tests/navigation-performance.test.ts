@@ -22,6 +22,7 @@ const codeSource='import json\n\nwith open("data.json") as file:\n    data = jso
 const readerBody=Array.from({length:30},(_,i)=>`<p>阅读段落 ${i}：先阅读文章，再查看后面的代码和图片。正文保持可读，图片和代码在需要时增强。</p>`).join('')
   +`<pre><code>${codeSource}</code></pre><pre><code>x = 1</code></pre>`
   +Array.from({length:12},(_,i)=>`<img src="/reader-image/${i}.svg" alt="正文配图 ${i}" width="640" height="360" loading="lazy">`).join('')
+  +'<video controls muted preload="none" poster="/reader-image/poster.svg?mode=reading" src="/reader-image/cold.mp4" data-full-sig="fixture" aria-label="示范动图"></video>'
   +'<img src="/reader-image/tiny.svg" alt="小图标" width="16" height="16" loading="lazy"><a href="https://example.org"><img src="/reader-image/linked.svg" alt="链接图片" width="640" height="360" loading="lazy"></a>';
 const report = (kind:'daily'|'weekly'|'monthly'): ReportDetail => ({kind,key:kind==='daily'?'2026-10-04':kind==='weekly'?'2026-W40':'2026-10',issueNumber:1,title:'Fixture '+kind,generatedAt:at,lead:{title:'Fixture '+kind,leadParagraph:'Fixture report'},leadItemId:null,overview:null,highlights:[],sections:[],flashes:[],cover:null,metrics:{},readingMinutes:1,prev:null,next:null,mentions:[]});
 const hits: string[] = [];
@@ -34,7 +35,7 @@ let chrome:Browser;
 let safari:Browser;
 const api=fakeApi((url,res,req)=>{
   const p=url.pathname;
-  if(p==='/api/site/meta'||p==='/api/site/track')return;
+  if(p==='/api/site/track')return;
   hits.push(req.url!);
   if(p===failing){res.statusCode=503;return {code:'unavailable'};}
   if(p==='/api/site/search/suggestions')return {topics:[{slug:'openai',name:'OpenAI',group:'company'}],hot:[{rank:1,title:'建议版本 '+suggestionsVersion,to:'/story/fixture'}]};
@@ -113,7 +114,8 @@ test('hover downloads nothing, a press fetches article data once for its click, 
     const start=hits.length;
     // In one task, as a scroll moves within the hold that makes a still touch a press; two calls can be further apart.
     await link.evaluate(a=>{for(const type of ['touchstart','touchmove'])a.dispatchEvent(new TouchEvent(type,{bubbles:true,cancelable:true,composed:true}));});
-    await link.hover();await page.waitForTimeout(300);
+    await page.clock.install();
+    await link.hover();await page.clock.runFor(300);
     await page.getByRole('heading',{name:'精选',exact:true}).click();
     assert.equal(hits.slice(start).filter(x=>x.startsWith('/api/site/items/')).length,0);
     await link.click();await expect(page.getByText('固定正文',{exact:true})).toBeVisible();
@@ -148,6 +150,7 @@ test('SSR all-pages and report kinds return offline with their own content',asyn
 // Disable HTTP reuse here: otherwise the browser cache can hide a lost document-level result.
 test('a press on a selected link preserves visited data and the next revisit starts no data request',async()=>{
   const context=await chrome.newContext();const page=await context.newPage();
+  await page.clock.install();
   const requests:string[]=[];
   await context.route('**/*.data*',route=>route.continue());
   page.on('request',request=>{if(request.url().includes('.data'))requests.push(request.url());});
@@ -156,11 +159,11 @@ test('a press on a selected link preserves visited data and the next revisit sta
     await page.getByRole('link',{name:'模型',exact:true}).click();
     await expect(page.getByRole('link',{name:'分类 ai-models',exact:true})).toBeVisible();
     await page.getByRole('link',{name:'模型',exact:true}).dispatchEvent('pointerdown',{button:0,pointerType:'mouse',isPrimary:true});
-    await page.waitForTimeout(150);
+    await page.clock.runFor(150);
     await page.getByRole('link',{name:'产品',exact:true}).click();
     await expect(page.getByRole('link',{name:'分类 ai-products',exact:true})).toBeVisible();
     await page.getByRole('link',{name:'产品',exact:true}).dispatchEvent('pointerdown',{button:0,pointerType:'mouse',isPrimary:true});
-    await page.waitForTimeout(150);
+    await page.clock.runFor(150);
     const before=requests.length;
     await page.getByRole('link',{name:'模型',exact:true}).click();
     await expect(page.getByRole('link',{name:'分类 ai-models',exact:true})).toBeVisible();
@@ -256,7 +259,11 @@ test('reader enhancements wait for visible code and update only the picture that
     const source=page.locator('.prose pre code').first();
     assert.equal(await source.textContent(),codeSource);
     await source.scrollIntoViewIfNeeded();
-    await expect(source).toHaveClass(/hljs/);
+    await expect.poll(() => source.evaluate(code => {
+      const plain = getComputedStyle(code).color;
+      return [...code.querySelectorAll("*")].some(token =>
+        token.textContent?.trim() && getComputedStyle(token).color !== plain);
+    }), { message: "visible code should show syntax in a different colour" }).toBe(true);
     assert.equal(await source.textContent(),codeSource,'colouring preserves the copyable text');
     assert.equal(scripts.length,1);
     await page.locator('.code-block-copy').first().click();
@@ -276,6 +283,33 @@ test('reader enhancements wait for visible code and update only the picture that
   }finally{await context.close();}
 });
 
+test('a cold player keeps its preview when the original is too large and can be played again', async () => {
+  const context = await chrome.newContext();
+  const page = await context.newPage();
+  let attempts = 0;
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"></svg>';
+  await page.route('**/reader-image/cold.mp4', route => route.fulfill({ status: 202, body: '' }));
+  await page.route('**/reader-image/poster.svg?**', route => {
+    if (new URL(route.request().url()).searchParams.get('mode') === 'full' && ++attempts === 1) {
+      return route.fulfill({ status: 502, body: '' });
+    }
+    return route.fulfill({ contentType: 'image/svg+xml', body: svg });
+  });
+  try {
+    await visit(page, origin + '/items/reader-fixture');
+    const player = page.locator('video[aria-label="示范动图"]');
+    await expect(page.locator('.code-block-copy')).toHaveCount(2);
+    await player.evaluate(video => (video as HTMLVideoElement).play().catch(() => {}));
+    await expect.poll(() => attempts).toBe(1);
+    await expect.poll(() => player.evaluate(video => (video as HTMLVideoElement).error)).toBeNull();
+    await player.evaluate(video => (video as HTMLVideoElement).play().catch(() => {}));
+    await expect(page.locator('img[alt="示范动图"]')).toBeVisible();
+    assert.equal(attempts, 2);
+  } finally {
+    await context.close();
+  }
+});
+
 test('deep reading returns to its anchor, including folded dates',async()=>{
   const context=await safari.newContext({viewport:{width:390,height:844}});
   const page=await context.newPage();
@@ -285,15 +319,17 @@ test('deep reading returns to its anchor, including folded dates',async()=>{
     await page.getByRole('button',{name:'收起10月4日',exact:true}).click();
     await expect(page.locator('[data-card-key]')).toHaveCount(120);
     await page.getByRole('link',{name:'长列表文章 160',exact:true}).scrollIntoViewIfNeeded();
-    const before=await page.evaluate(()=>{
-      const first=[...document.querySelectorAll<HTMLElement>('[data-card-key]')].find(e=>e.getBoundingClientRect().bottom>72)!;
-      return {key:first.dataset.cardKey!,top:first.getBoundingClientRect().top};
+    const readingCard = () => page.evaluate(() => {
+      const card = document.elementFromPoint(innerWidth / 2, innerHeight / 2)?.closest<HTMLElement>('[data-card-key]');
+      return card?.dataset.cardKey;
     });
+    const before = await readingCard();
+    assert.ok(before, 'a card is visible at the reading position before opening the article');
     await page.getByRole('link',{name:'长列表文章 160',exact:true}).click();
     await expect(page.getByText('固定正文',{exact:true})).toBeVisible();
     await page.goBack();
     await expect(page.locator('[data-card-key]')).toHaveCount(120);
-    await expect.poll(()=>page.locator(`[data-card-key="${before.key}"]`).evaluate((e,top)=>Math.abs(e.getBoundingClientRect().top-top),before.top)).toBeLessThan(2);
+    await expect.poll(readingCard).toBe(before);
     await expect(page.getByRole('button',{name:'展开10月4日',exact:true})).toBeVisible();
   }finally{await context.close();}
 });

@@ -2,12 +2,14 @@
 // it. The item's own text and translation often only make sense next to it.
 import type { QuotedPostView, XPostView } from "@aihot/contracts/site";
 import { shortAddresses } from "@aihot/contracts/addresses";
-import { IconArrowUpRight } from "../../components/icons";
+import { IconArrowUpRight, IconChevronRight } from "../../components/icons";
+import { useT } from "../../lib/i18n";
 
 function Author({ quoted }: { quoted: Pick<QuotedPostView, "authorName" | "handle"> }) {
+  const t = useT();
   return (
     <>
-      <span className="text-ink-4">引用</span>
+      <span className="text-ink-4">{t("引用", "Quoting")}</span>
       <span className="font-semibold text-ink-2">{quoted.authorName || `@${quoted.handle}`}</span>
       {quoted.authorName && quoted.handle && <span className="text-ink-4">@{quoted.handle}</span>}
     </>
@@ -19,22 +21,27 @@ function Author({ quoted }: { quoted: Pick<QuotedPostView, "authorName" | "handl
  * original), set as the post's own text is: paragraphs, lists, addresses as short links.
  */
 export function QuotedPost({ quoted, original = false }: { quoted: QuotedPostView; original?: boolean }) {
+  const t = useT();
   const zh = original ? null : quoted.translationHtml;
   return (
     <figure className="mt-6 rounded-tile border border-line px-4 py-3.5">
-      <figcaption className="flex flex-wrap items-baseline gap-x-1.5 text-[13px]">
+      <figcaption className="flex flex-wrap items-baseline gap-x-1.5 text-ui-label">
         <Author quoted={quoted} />
       </figcaption>
       <blockquote className="prose prose-quote mt-2" dangerouslySetInnerHTML={{ __html: zh ?? quoted.html }} />
+      {/* Phones and touch screens: the toggle and the link are 44px tall, their spacing taken into that height. */}
       {zh && (
-        <details className="mt-2 text-[13px] text-ink-4">
-          <summary className="cursor-pointer select-none hover:text-ink-3">原文</summary>
-          <div className="prose prose-quote-original mt-1.5" dangerouslySetInnerHTML={{ __html: quoted.html }} />
+        <details className="disclosure group/original mt-0 text-ui-label text-ink-4 lg:mt-2 touch:mt-0">
+          <summary className="flex select-none items-center gap-0.5 py-3 hover:text-ink-3 lg:py-0 touch:py-3">
+            {t("原文", "Original")}
+            <IconChevronRight size={13} className="turn group-open/original:rotate-90" />
+          </summary>
+          <div className="prose prose-quote-original mt-0 lg:mt-1.5 touch:mt-0" dangerouslySetInnerHTML={{ __html: quoted.html }} />
         </details>
       )}
       {quoted.url && (
-        <a href={quoted.url} target="_blank" rel="noopener noreferrer" className="mt-2 inline-flex items-center gap-0.5 text-[13px] text-accent hover:text-accent-ink">
-          在 X 查看被引用的帖子 <IconArrowUpRight size={13} />
+        <a href={quoted.url} target="_blank" rel="noopener noreferrer" className="mt-0 inline-flex min-h-11 items-center gap-0.5 text-ui-label text-accent hover:text-accent-ink lg:mt-2 lg:min-h-0 touch:mt-0 touch:min-h-11">
+          {t("在 X 查看被引用的帖子 ", "View the quoted post on X ")}<IconArrowUpRight size={13} />
         </a>
       )}
     </figure>
@@ -44,7 +51,7 @@ export function QuotedPost({ quoted, original = false }: { quoted: QuotedPostVie
 /** Feed card: who is quoted and the start of what they said, addresses short (the card itself opens the item). */
 export function QuotedLine({ quoted }: { quoted: Omit<NonNullable<XPostView["quoted"]>, "url"> }) {
   return (
-    <div className="mt-2.5 rounded-tile border border-line-soft px-3 py-2 text-[13px] leading-[1.6]">
+    <div className="mt-2.5 rounded-tile border border-line-soft px-3 py-2 text-ui-label leading-[1.6]">
       <div className="flex flex-wrap items-baseline gap-x-1.5">
         <Author quoted={quoted} />
       </div>

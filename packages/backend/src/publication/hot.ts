@@ -8,7 +8,6 @@ import { shared } from "../lib/cache.ts";
 import { proxiedImage, proxiedImageSet } from "../media/imgproxy.ts";
 import { publicSourceName } from "./rules.ts";
 import { evidenceCondition, listedCondition } from "./scope.ts";
-import { storyTexts } from "./story-text.ts";
 
 // Concurrent reads are shared, nothing more: public words follow withdrawals and regrouping at once.
 const ranking = shared<void, HotRanking | null>(() => "latest", queryLatestHotRanking);
@@ -38,7 +37,7 @@ async function queryLatestHotRanking(): Promise<HotRanking | null> {
       FROM facts f JOIN fact_articles fa ON fa.fact_id = f.id JOIN publications p ON p.article_id = fa.article_id
       WHERE f.story_id = st.id AND ${evidenceCondition()} AND ${listedCondition(now)}
     ) latest ON true
-    WHERE f.story_id IN ${sql(entries.map((entry) => entry.storyId))} AND p.article_id IN ${sql(entries.map((entry) => entry.representativeItemId ?? ""))}
+    WHERE f.story_id IN ${sql(entries.map((entry) => entry.storyId))} AND st.merged_into IS NULL AND p.article_id IN ${sql(entries.map((entry) => entry.representativeItemId ?? ""))}
       AND ${evidenceCondition()} AND ${listedCondition(now)}
     ORDER BY f.story_id, p.article_id, (fa.role = 'primary') DESC, f.id` : [];
   const valid = new Map(current.map((report) => [`${report.story_id}:${report.article_id}`, report]));
@@ -51,62 +50,44 @@ async function queryLatestHotRanking(): Promise<HotRanking | null> {
   return { ...row, entries: visible };
 }
 
-interface Extras {
-  faces: Map<string, string | null>;
-  texts: Map<number, { summary: string | null; latest: string | null }>;
-}
+/** Participants' public names and faces across the whole ranking, shared by the home strip and the hot page. */
+export const rankingParticipants = shared((ranking: HotRanking) => String(ranking.id), queryRankingParticipants);
 
-const readExtras = shared((ranking: HotRanking) => String(ranking.id), queryExtras);
-
-async function queryExtras(ranking: HotRanking): Promise<Extras> {
+async function queryRankingParticipants(ranking: HotRanking) {
   const ids = ranking.entries.map((e) => e.storyId);
-  const [faces, texts] = await Promise.all([
-    // A participant's face: the source's icon, else the avatar on that account's latest post in the story.
-    // A null lookup key skips the article read; an ON guard can still fetch it before filtering.
-    sql<{ name: string; icon_url: string | null; avatar: string | null }[]>`
-      SELECT DISTINCT ON (s.id) s.name, s.icon_url, a.x_post->>'avatarUrl' AS avatar
-      FROM story_signals ss JOIN sources s ON s.id = ss.source_id
-      LEFT JOIN articles a ON a.id = CASE WHEN s.icon_url IS NULL THEN ss.article_id END AND a.x_post ? 'avatarUrl'
-        AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.article_id = a.id AND (p.suppress_original OR p.visibility <> 'public'))
-      WHERE ss.story_id = ANY(${ids}::bigint[])
-      ORDER BY s.id, (a.id IS NULL), a.discovered_at DESC, a.id DESC`,
-    storyTexts(ids),
-  ]);
-  return {
-    faces: new Map(faces.map((f) => [f.name, f.icon_url ?? f.avatar])),
-    texts: new Map([...texts].map(([id, t]) => [id, { summary: t.digest ?? t.summary, latest: t.latest?.title ?? null }])),
-  };
-}
-
-/**
- * What the web adds to a ranking entry: participants with proxied faces in the order Faces shows them
- * (精选组 by tier, a real face before an initial within a tier, then 氛围组), the digest and the latest turn.
- */
-export async function rankingExtras(ranking: HotRanking) {
-  const { faces, texts } = await readExtras(ranking);
-  return {
-    participants: (e: HotEntry): HotParticipant[] => {
-      const people = e.participants
-        .map((p, i) => ({ p, i, icon: faces.get(p.name) ?? null }))
-        .sort((x, y) => Number(y.p.kind === "editorial") - Number(x.p.kind === "editorial") || tierRank(x.p.tier) - tierRank(y.p.tier) || Number(!!y.icon) - Number(!!x.icon) || x.i - y.i);
-      // A publisher's blog and its X account share a public name: listed once, with the first face.
-      const named = new Map<string, (typeof people)[number]>();
-      for (const person of people) {
-        const name = publicSourceName(person.p.name);
-        if (!named.has(name)) named.set(name, person);
+  // A participant's face: the source's icon, else the avatar on that account's latest post in the story.
+  // A null lookup key skips the article read; an ON guard can still fetch it before filtering.
+  const faces = await sql<{ id: string; name: string; icon_url: string | null; avatar: string | null }[]>`
+    SELECT DISTINCT ON (s.id) s.id, s.name, s.icon_url, a.x_post->>'avatarUrl' AS avatar
+    FROM story_signals ss JOIN sources s ON s.id = ss.source_id
+    LEFT JOIN articles a ON a.id = CASE WHEN s.icon_url IS NULL THEN ss.article_id END AND a.x_post ? 'avatarUrl'
+      AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.article_id = a.id AND (p.suppress_original OR p.visibility <> 'public'))
+    WHERE ss.story_id = ANY(${ids}::bigint[])
+    ORDER BY s.id, (a.id IS NULL), a.discovered_at DESC, a.id DESC`;
+  const facesById = new Map(faces.map((f) => [f.id, { name: f.name, icon: f.icon_url ?? f.avatar }]));
+  return (e: HotEntry): HotParticipant[] => {
+    const people = e.participants
+      .map((p, i) => {
+        const live = facesById.get(p.sourceId);
+        return { p, i, name: live?.name ?? p.name, icon: live?.icon ?? null };
+      })
+      .sort((x, y) => Number(y.p.kind === "editorial") - Number(x.p.kind === "editorial") || tierRank(x.p.tier) - tierRank(y.p.tier) || Number(!!y.icon) - Number(!!x.icon) || x.i - y.i);
+    // A publisher's blog and its X account share a public name: listed once, with the first face.
+    const named = new Map<string, (typeof people)[number]>();
+    for (const person of people) {
+      const name = publicSourceName(person.name);
+      if (!named.has(name)) named.set(name, person);
+    }
+    // Every name stays for the tooltip; only visible faces carry image URLs.
+    return [...named].map(([name, { p, icon }], i): HotParticipant => {
+      const person: HotParticipant = { sourceId: p.sourceId, name, kind: p.kind };
+      if (p.kind === "editorial" && i < HOT_FACE_LIMIT) {
+        person.iconUrl = proxiedImage(icon, "avatar");
+        const srcSet = proxiedImageSet(icon, "avatar");
+        if (srcSet) person.iconSrcSet = srcSet;
       }
-      // Every name stays for the tooltip; only visible faces carry image URLs.
-      return [...named].map(([name, { p, icon }], i): HotParticipant => {
-        const person: HotParticipant = { name, kind: p.kind };
-        if (p.kind === "editorial" && i < HOT_FACE_LIMIT) {
-          person.iconUrl = proxiedImage(icon, "avatar");
-          const srcSet = proxiedImageSet(icon, "avatar");
-          if (srcSet) person.iconSrcSet = srcSet;
-        }
-        return person;
-      });
-    },
-    text: (e: HotEntry) => texts.get(e.storyId) ?? { summary: null, latest: null },
+      return person;
+    });
   };
 }
 
@@ -114,7 +95,7 @@ export async function rankingExtras(ranking: HotRanking) {
 export async function loadHotStrip(): Promise<HotStripEntry[] | null> {
   const ranking = await latestHotRanking();
   if (!ranking || ranking.entries.length < 3) return null;
-  const extras = await rankingExtras(ranking);
+  const participants = await rankingParticipants(ranking);
   return ranking.entries.slice(0, 5).map((e) => ({
     rank: e.rank,
     title: e.title,
@@ -122,7 +103,7 @@ export async function loadHotStrip(): Promise<HotStripEntry[] | null> {
     trend: e.trend,
     storyPublicId: e.storyPublicId,
     itemId: e.representativeItemId,
-    participants: extras.participants(e),
+    participants: participants(e),
     participantCount: e.participantCount,
   }));
 }

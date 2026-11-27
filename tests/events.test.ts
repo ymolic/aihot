@@ -1,3 +1,4 @@
+import { pollFor } from "./poll.ts";
 // Event grouping invariants: an editor's decision made while the model is deciding stands; a
 // revision keeps its membership without asking the model; an explicit regroup drops the automatic
 // membership at once and decides again; a story's root is its earliest fact that still holds reports;
@@ -15,7 +16,7 @@ import { mergeFactInto, mergeStoryInto } from "@aihot/backend/events/merge";
 import { candidateViews } from "@aihot/backend/events/recall";
 import { stopBoss } from "@aihot/backend/jobs/queue";
 import { publishArticle } from "@aihot/backend/publication/publish";
-import { resolveStory } from "@aihot/backend/publication/stories";
+import { loadStoryDetail, resolveStory } from "@aihot/backend/publication/stories";
 
 const T = tag();
 const SOURCE = `test-events-${T}`;
@@ -135,6 +136,8 @@ test("merging facts moves reports, roles, heat and attached posts, and an emptie
   assert.deepEqual([Number(published!.fact_id), Number(published!.story_id)], [into.fact, into.story]);
   const [emptied] = await sql<{ merged_into: number | null }[]>`SELECT merged_into FROM stories WHERE id = ${from.story}`;
   assert.equal(Number(emptied!.merged_into), into.story);
+  const [alias] = await sql`SELECT a.story_id FROM stories old JOIN story_aliases a ON a.public_id = old.public_id WHERE old.id = ${from.story}`;
+  assert.equal(Number(alias?.story_id), into.story, "合并后将旧公开编号指向存续事件，保留读者原链接");
   for (const id of [moved, post]) assert.equal((await sql`SELECT 1 FROM story_signals WHERE story_id = ${into.story} AND article_id = ${id}`).length, 1, "heat follows");
   const [decision] = await sql<{ fact_id: number; story_id: number }[]>`SELECT fact_id, story_id FROM grouping_decisions WHERE article_id = ${post}`;
   assert.deepEqual([Number(decision!.fact_id), Number(decision!.story_id)], [into.fact, into.story], "recall finds the post's fact through its decision");
@@ -196,7 +199,7 @@ test("grouping merges no fact holding an editor's placement, nor one being corre
     await tx`DELETE FROM fact_articles WHERE article_id = ${contested}`;
     await tx`INSERT INTO fact_articles (fact_id, article_id, role, manual) VALUES (${elsewhere.fact}, ${contested}, 'report', true)`;
     merging = mergeFactInto(from.fact, into.fact, "test", "grouping");
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await pollFor(async () => (await sql`SELECT 1 FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'`).length > 0, "the concurrent operation to reach the database lock");
   });
   await merging!;
   const memberships = await sql<{ fact_id: number }[]>`SELECT fact_id FROM fact_articles WHERE article_id = ${contested}`;
@@ -267,6 +270,11 @@ test("old story addresses and grouping targets reach the survivor after a long s
   for (const publicId of [original!.public_id, alias]) assert.deepEqual(await resolveStory(publicId), { kind: "merged", target: survivor!.public_id });
   assert.deepEqual(await resolveStory(survivor!.public_id), { kind: "found", storyId: last.story, publicId: survivor!.public_id });
   assert.equal(await liveStory(first.story), last.story);
+  // Multi-hop merges flatten merged_into and story_aliases directly onto the surviving story.
+  const [flattened] = await sql<{ merged_into: number | null }[]>`SELECT merged_into FROM stories WHERE id = ${first.story}`;
+  assert.equal(Number(flattened!.merged_into), last.story);
+  const [flattenedAlias] = await sql<{ story_id: number }[]>`SELECT story_id FROM story_aliases WHERE public_id = ${alias}`;
+  assert.equal(Number(flattenedAlias!.story_id), last.story);
   const [publication] = await sql`SELECT story_id FROM publications WHERE article_id = ${moved}`;
   assert.equal(publication!.story_id, last.story);
 });
@@ -406,7 +414,7 @@ test("detaching a discussion post removes its signal even though it has no fact 
   const source = `${SOURCE}-discussion`;
   await sql`INSERT INTO sources (id,name,kind,tier,participation_mode) VALUES (${source},'Discussion','x_search','T2','hot_signal')`;
   const { articleId } = await upsertMaterial({ sourceId: source, url: "https://x.com/example/status/999000112", title: "Reaction",
-    publishedAt: new Date(), bodyText: "Reaction", bodyStatus: "ok", via: "fetch",
+    publishedAt: new Date(Date.now() - 60_000), bodyText: "Reaction", bodyStatus: "ok", via: "fetch",
     xPost: { tweetId: "999000112", handle: "example", authorName: "Example", text: "Reaction", replyTo: "999000111" } });
   assert.equal((await groupArticle(articleId, { signalOnly: true })).storyId, root.storyId);
   await detachFromFact(articleId, "unrelated reaction", "test-editor");
@@ -422,7 +430,7 @@ test("a manual detach during a discussion judgement wins just as it does for an 
   const source = `${SOURCE}-discussion-race`;
   await sql`INSERT INTO sources (id,name,kind,tier,participation_mode) VALUES (${source},'Discussion race','rss','T2','hot_signal')`;
   const { articleId } = await upsertMaterial({ sourceId: source, url: `https://example.org/${source}`, title: reaction,
-    publishedAt: new Date(), bodyText: reaction, bodyStatus: "ok", via: "fetch" });
+    publishedAt: new Date(Date.now() - 60_000), bodyText: reaction, bodyStatus: "ok", via: "fetch" });
   hold = gate(); asked = gate();
   const pending = groupArticle(articleId, { signalOnly: true });
   await Promise.race([asked.promise, pending.then(() => assert.fail("expected a signal judgement"))]);
@@ -685,4 +693,53 @@ test("stories that reports keep tying together without merging list each other a
     pairRelation = null;
     answerAll = false;
   }
+});
+
+test("long report and fact titles stay complete on stories and story developments instead of slicing at 60 characters", async () => {
+  hold = gate();
+  hold.open();
+  const anchor = randomText();
+  const rootTitle = `${anchor}：研究机构公开完整技术评估报告指出大型推理模型虽在形式化证明取得重要突破但目前仍难以泛化到新领域`;
+  const devTitle = `${anchor}：Gary Marcus 评 Levent Alpöge 借助 Claude 证明黎曼猜想：不是 AI 独立完成，也难以泛化`;
+  const frameTitle = `${randomText()}：研究团队正式公布最新可验证数学推理基准并同步开放全部代码权重与详细评测复现文档供社区独立核验`;
+  assert.ok(rootTitle.length > 60 && devTitle.length > 60 && frameTitle.length > 60);
+
+  const sharedSummary = `${randomText()}${randomText()}${randomText()}${randomText()}${randomText()}`;
+  const rootId = await report("long-root", rootTitle, `${sharedSummary} 根报道摘要`);
+  await sql`UPDATE analyses SET output = ${sql.json({ scope: "single", fact: null })} WHERE article_id = ${rootId}`;
+  await publishArticle(rootId);
+  const root = await groupArticle(rootId);
+  assert.equal(root.verdict, "new-story");
+
+  const [rootRow] = await sql<{ story_title: string; fact_title: string }[]>`
+    SELECT st.title AS story_title, f.title AS fact_title FROM facts f JOIN stories st ON st.id = f.story_id WHERE f.id = ${root.factId!}`;
+  assert.equal(rootRow!.story_title, rootTitle);
+  assert.equal(rootRow!.fact_title, rootTitle);
+
+  const devId = await report("long-dev", devTitle, `${sharedSummary} 后续评论摘要`);
+  await sql`UPDATE analyses SET output = ${sql.json({ scope: "single", fact: null })} WHERE article_id = ${devId}`;
+  await publishArticle(devId);
+  relation = "SAME_STORY";
+  try {
+    const dev = await groupArticle(devId);
+    assert.equal(dev.verdict, "new-fact-in-story");
+    assert.equal(dev.storyId, root.storyId);
+    const [devFact] = await sql<{ title: string }[]>`SELECT title FROM facts WHERE id = ${dev.factId!}`;
+    assert.equal(devFact!.title, devTitle);
+
+    const detail = await loadStoryDetail(root.storyId!);
+    assert.ok(detail !== null);
+    assert.deepEqual(new Set(detail.developments.map((d) => d.title)), new Set([rootTitle, devTitle]));
+  } finally {
+    relation = "SAME_OCCURRENCE";
+  }
+
+  const frameId = await report("long-frame", frameTitle, "带长事实标题的报道");
+  await setScope(frameId, "single", { title: frameTitle, subject: "研究团队", action: "公布", object: "基准" });
+  const framed = await groupArticle(frameId);
+  assert.equal(framed.verdict, "new-story");
+  const [framedRow] = await sql<{ story_title: string; fact_title: string }[]>`
+    SELECT st.title AS story_title, f.title AS fact_title FROM facts f JOIN stories st ON st.id = f.story_id WHERE f.id = ${framed.factId!}`;
+  assert.equal(framedRow!.story_title, frameTitle);
+  assert.equal(framedRow!.fact_title, frameTitle);
 });

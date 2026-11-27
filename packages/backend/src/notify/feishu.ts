@@ -112,6 +112,11 @@ interface FindingFields {
    * stays on the ops list only.
    */
   agentOnly?: true;
+  /**
+   * How long it must stay gone before its recovery is told; back within that time it is the same incident and
+   * nothing is sent (operations/alerts.ts). For problems that come and go, such as a provider's outage.
+   */
+  settles?: number;
 }
 
 /**
@@ -119,6 +124,8 @@ interface FindingFields {
  * is the hub's to say. No default: a new kind must not fall silently to another kind's handling.
  */
 export type Finding = FindingFields & ({ agentOnly?: undefined; agentType?: undefined } | { agentOnly: true; agentType: `alert.${string}` });
+
+export type FollowUp = Finding & { level: "later" };
 
 const MARK: Record<Exclude<Level, "later">, string> = { now: "🔴", today: "🟠" };
 
